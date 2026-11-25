@@ -1,0 +1,318 @@
+"use server";
+
+import { prisma } from "@/lib/prisma";
+import { MSG_EMPRESA_NAO_LIBERADA, podeEmpresa, requirePermissao } from "@/lib/session";
+import { parseBancoHoras, type BancoHorasLinha } from "@/lib/parsers/banco-horas";
+import { processarHistorico, type CompetenciaEntrada } from "@/lib/banco-horas";
+import { cargoForaDoBancoDeHoras, funcaoNaoPodeCredito } from "@/lib/banco-horas-alertas";
+import { estaCongeladoNaCompetencia } from "@/lib/banco-horas-afastamento";
+
+function compararCompetencias(a: string, b: string): number {
+  const [ma, aa] = a.split("/").map(Number);
+  const [mb, ab] = b.split("/").map(Number);
+  return aa !== ab ? aa - ab : ma - mb;
+}
+
+export type PreviewLinhaBancoHoras = { matricula: string; nome: string; competencias: string[] };
+
+export type PreviewAlertaCredito = { matricula: string; nome: string; cargo: string; competencias: string[] };
+
+export type PreviewBancoHorasResult = {
+  empresa: { codigo: string; nome: string };
+  periodoInicio: string;
+  periodoFim: string;
+  encontrados: PreviewLinhaBancoHoras[];
+  naoEncontrados: PreviewLinhaBancoHoras[];
+  competenciasJaImportadas: string[];
+  alertasCredito: PreviewAlertaCredito[];
+};
+
+async function montarPreview(parsed: { empresa: { codigo: string; nome: string }; linhas: BancoHorasLinha[] }, empresaId: string) {
+  const porMatricula = new Map<string, string[]>();
+  for (const l of parsed.linhas) {
+    const lista = porMatricula.get(l.matricula) ?? [];
+    if (!lista.includes(l.competencia)) lista.push(l.competencia);
+    porMatricula.set(l.matricula, lista);
+  }
+
+  const funcionarios = await prisma.funcionario.findMany({
+    where: { empresaId, matricula: { in: [...porMatricula.keys()] } },
+    select: { matricula: true, nome: true, temGratificacao: true, cargo: { select: { nome: true } } },
+  });
+  const funcPorMatricula = new Map(funcionarios.map((f) => [f.matricula, f]));
+
+  const encontrados: PreviewLinhaBancoHoras[] = [];
+  const naoEncontrados: PreviewLinhaBancoHoras[] = [];
+  const alertasCredito: PreviewAlertaCredito[] = [];
+  for (const [matricula, competencias] of porMatricula) {
+    const func = funcPorMatricula.get(matricula);
+    const item = { matricula, nome: func?.nome ?? "", competencias: competencias.sort(compararCompetencias) };
+    if (func && cargoForaDoBancoDeHoras(func.cargo.nome)) {
+      continue;
+    } else if (func) {
+      encontrados.push(item);
+      const competenciasComCredito = competencias.filter((c) =>
+        parsed.linhas.some((l) => l.matricula === matricula && l.competencia === c && l.creditoDecimal > 0.001)
+      );
+      if (competenciasComCredito.length > 0 && funcaoNaoPodeCredito(func.cargo.nome, func.temGratificacao)) {
+        alertasCredito.push({ matricula, nome: func.nome, cargo: func.cargo.nome, competencias: competenciasComCredito });
+      }
+    } else {
+      naoEncontrados.push({ ...item, nome: `(não encontrado no cadastro)` });
+    }
+  }
+
+  const todasCompetencias = [...new Set(parsed.linhas.map((l) => l.competencia))].sort(compararCompetencias);
+  const existentes = await prisma.bancoHorasApuracao.findMany({
+    where: { funcionario: { empresaId }, competencia: { in: todasCompetencias } },
+    select: { competencia: true },
+    distinct: ["competencia"],
+  });
+
+  return {
+    encontrados: encontrados.sort((a, b) => a.matricula.localeCompare(b.matricula)),
+    naoEncontrados: naoEncontrados.sort((a, b) => a.matricula.localeCompare(b.matricula)),
+    competenciasJaImportadas: existentes.map((e) => e.competencia).sort(compararCompetencias),
+    alertasCredito: alertasCredito.sort((a, b) => a.matricula.localeCompare(b.matricula)),
+  };
+}
+
+export async function previewExtratoBancoHoras(
+  conteudo: string
+): Promise<{ data: PreviewBancoHorasResult | null; error: string | null }> {
+  const user = await requirePermissao("banco-horas", "operar");
+
+  let parsed;
+  try {
+    parsed = parseBancoHoras(conteudo);
+  } catch (e) {
+    return { data: null, error: e instanceof Error ? e.message : "Erro ao processar o arquivo." };
+  }
+
+  const empresa = await prisma.empresa.findUnique({ where: { codigo: parsed.empresa.codigo } });
+  if (!empresa) {
+    return {
+      data: null,
+      error: `Empresa ${parsed.empresa.codigo} (${parsed.empresa.nome}) ainda não está cadastrada — importe o cadastro dela antes.`,
+    };
+  }
+  if (!(await podeEmpresa(user, empresa.id))) return { data: null, error: MSG_EMPRESA_NAO_LIBERADA };
+
+  const diff = await montarPreview(parsed, empresa.id);
+
+  return {
+    data: {
+      empresa: parsed.empresa,
+      periodoInicio: parsed.periodoInicio,
+      periodoFim: parsed.periodoFim,
+      ...diff,
+    },
+    error: null,
+  };
+}
+
+export type AlertaCongelamento = { matricula: string; nome: string; competencia: string; motivoAfastamento: string | null };
+
+export async function confirmarExtratoBancoHoras(
+  conteudo: string,
+  nomeArquivo: string
+): Promise<{
+  error: string | null;
+  resumo?: {
+    funcionarios: number;
+    competenciasRecalculadas: number;
+    naoEncontrados: number;
+    alertasCongelamento: AlertaCongelamento[];
+  };
+}> {
+  const admin = await requirePermissao("banco-horas", "operar");
+
+  let parsed;
+  try {
+    parsed = parseBancoHoras(conteudo);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "Erro ao processar o arquivo." };
+  }
+
+  const empresa = await prisma.empresa.findUnique({ where: { codigo: parsed.empresa.codigo } });
+  if (!empresa) {
+    return {
+      error: `Empresa ${parsed.empresa.codigo} (${parsed.empresa.nome}) ainda não está cadastrada — importe o cadastro dela antes.`,
+    };
+  }
+  if (!(await podeEmpresa(admin, empresa.id))) return { error: MSG_EMPRESA_NAO_LIBERADA };
+
+  const linhasPorMatricula = new Map<string, BancoHorasLinha[]>();
+  for (const l of parsed.linhas) {
+    const lista = linhasPorMatricula.get(l.matricula) ?? [];
+    lista.push(l);
+    linhasPorMatricula.set(l.matricula, lista);
+  }
+
+  const funcionarios = await prisma.funcionario.findMany({
+    where: { empresaId: empresa.id, matricula: { in: [...linhasPorMatricula.keys()] } },
+    select: {
+      id: true,
+      matricula: true,
+      nome: true,
+      status: true,
+      dataAfastamento: true,
+      dataRetorno: true,
+      motivoAfastamento: true,
+      cargo: { select: { nome: true } },
+    },
+  });
+  const funcPorMatricula = new Map(funcionarios.map((f) => [f.matricula, f]));
+  const naoEncontrados = [...linhasPorMatricula.keys()].filter((m) => !funcPorMatricula.has(m));
+
+  let competenciasRecalculadas = 0;
+  let funcionariosTocados = 0;
+  const alertasCongelamento: AlertaCongelamento[] = [];
+
+  // Banco de horas "pelo extrato" (ex.: LOGTRANS): o ERP já fecha o banco dentro do mês — grava a
+  // Hora Paga e o Saldo Atual do arquivo como estão, sem passar pelo motor de cálculo.
+  const peloExtrato = empresa.bancoHorasModo === "extrato";
+  if (peloExtrato) {
+    const semColunas = parsed.linhas.filter((l) => l.horaPagaDecimal === null || l.saldoAtualDecimal === null);
+    if (semColunas.length > 0) {
+      return {
+        error: `O extrato não trouxe as colunas Hora Paga e Saldo Atual (matrícula ${semColunas[0].matricula}) — essa empresa usa o banco de horas direto do extrato do ERP.`,
+      };
+    }
+  }
+
+  await prisma.$transaction(
+    async (tx) => {
+      for (const [matricula, novasLinhas] of linhasPorMatricula) {
+        const func = funcPorMatricula.get(matricula);
+        if (!func || cargoForaDoBancoDeHoras(func.cargo.nome)) continue;
+
+        if (peloExtrato) {
+          for (const l of novasLinhas) {
+            const saldoAtual = l.saldoAtualDecimal!;
+            const dados = {
+              creditoBruto: l.creditoDecimal,
+              debitoBruto: l.debitoDecimal,
+              creditoLiquido: l.creditoDecimal,
+              pagoNoMes: l.horaPagaDecimal!,
+              saldoPositivo: Math.max(saldoAtual, 0),
+              saldoNegativo: Math.min(saldoAtual, 0),
+              saldoFinal: saldoAtual,
+              congelado: false,
+            };
+            await tx.bancoHorasApuracao.upsert({
+              where: { funcionarioId_competencia: { funcionarioId: func.id, competencia: l.competencia } },
+              create: { funcionarioId: func.id, competencia: l.competencia, ...dados },
+              update: dados,
+            });
+            competenciasRecalculadas++;
+          }
+          funcionariosTocados++;
+          continue;
+        }
+
+        const saldoInicial = await tx.bancoHorasSaldoInicial.findUnique({ where: { funcionarioId: func.id } });
+
+        // Reconstrói a série completa de crédito/débito bruto já persistida (regra e: reimportação
+        // sobrescreve a competência e recalcula o histórico a partir dela — como o motor é
+        // determinístico e barato, reprocessamos a série inteira do funcionário).
+        const apuracoesExistentes = await tx.bancoHorasApuracao.findMany({ where: { funcionarioId: func.id } });
+        const seriePorCompetencia = new Map<string, CompetenciaEntrada>(
+          apuracoesExistentes.map((a) => [
+            a.competencia,
+            {
+              competencia: a.competencia,
+              creditoDecimal: Number(a.creditoBruto),
+              debitoDecimal: Number(a.debitoBruto),
+              zerarSaldo: a.saldoZeradoManual,
+            },
+          ])
+        );
+        for (const l of novasLinhas) {
+          seriePorCompetencia.set(l.competencia, {
+            competencia: l.competencia,
+            creditoDecimal: l.creditoDecimal,
+            debitoDecimal: l.debitoDecimal,
+            // Reimportar o mês não desfaz o zeramento manual feito pelo DP.
+            zerarSaldo: seriePorCompetencia.get(l.competencia)?.zerarSaldo,
+          });
+        }
+        // Funcionário afastado há mais de 30 dias nesta competência: congela o saldo (ver
+        // src/lib/banco-horas-afastamento.ts) — nada é pago até ele retornar.
+        for (const entrada of seriePorCompetencia.values()) {
+          entrada.congelado = estaCongeladoNaCompetencia(func, entrada.competencia);
+        }
+        const serie = [...seriePorCompetencia.values()].sort((a, b) => compararCompetencias(a.competencia, b.competencia));
+
+        const saldoInicialDecimal = saldoInicial ? Number(saldoInicial.saldoDecimal) : 0;
+        const { apuracoes } = processarHistorico(saldoInicialDecimal, serie);
+
+        const competenciasNovas = new Set(novasLinhas.map((l) => l.competencia));
+        for (let i = 0; i < apuracoes.length; i++) {
+          const a = apuracoes[i];
+          const estavaCongeladoAntes = i > 0 && apuracoes[i - 1].congelado;
+          if (a.congelado && !estavaCongeladoAntes && competenciasNovas.has(a.competencia)) {
+            alertasCongelamento.push({
+              matricula: func.matricula,
+              nome: func.nome,
+              competencia: a.competencia,
+              motivoAfastamento: func.motivoAfastamento,
+            });
+          }
+
+          await tx.bancoHorasApuracao.upsert({
+            where: { funcionarioId_competencia: { funcionarioId: func.id, competencia: a.competencia } },
+            create: {
+              funcionarioId: func.id,
+              competencia: a.competencia,
+              creditoBruto: a.creditoBrutoDecimal,
+              debitoBruto: a.debitoBrutoDecimal,
+              creditoLiquido: a.creditoLiquidoDecimal,
+              pagoNoMes: a.pagoNoMesDecimal,
+              saldoPositivo: a.saldoPositivoDecimal,
+              saldoNegativo: a.saldoNegativoDecimal,
+              saldoFinal: a.saldoFinalDecimal,
+              congelado: a.congelado,
+            },
+            update: {
+              creditoBruto: a.creditoBrutoDecimal,
+              debitoBruto: a.debitoBrutoDecimal,
+              creditoLiquido: a.creditoLiquidoDecimal,
+              pagoNoMes: a.pagoNoMesDecimal,
+              saldoPositivo: a.saldoPositivoDecimal,
+              saldoNegativo: a.saldoNegativoDecimal,
+              saldoFinal: a.saldoFinalDecimal,
+              congelado: a.congelado,
+            },
+          });
+        }
+        competenciasRecalculadas += apuracoes.length;
+        funcionariosTocados++;
+      }
+
+      await tx.bancoHorasImportacao.create({
+        data: {
+          empresaId: empresa.id,
+          importadoPorId: admin.id,
+          nomeArquivo,
+          periodoInicio: parsed.periodoInicio,
+          periodoFim: parsed.periodoFim,
+          criados: funcionariosTocados,
+          atualizados: 0,
+          naoEncontrados: naoEncontrados.length > 0 ? JSON.stringify(naoEncontrados) : null,
+        },
+      });
+    },
+    { timeout: 60_000 }
+  );
+
+  return {
+    error: null,
+    resumo: {
+      funcionarios: funcionariosTocados,
+      competenciasRecalculadas,
+      naoEncontrados: naoEncontrados.length,
+      alertasCongelamento: alertasCongelamento.sort((a, b) => a.matricula.localeCompare(b.matricula)),
+    },
+  };
+}

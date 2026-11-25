@@ -1,0 +1,39 @@
+import { prisma } from "@/lib/prisma";
+import { escopoEmpresa, requirePermissao } from "@/lib/session";
+import { TerceirosTable } from "./terceiros-table";
+
+export default async function TerceirosPage() {
+  const user = await requirePermissao("terceiros", "consultar");
+  const escopo = await escopoEmpresa(user);
+  const [terceiros, empresas] = await Promise.all([
+    prisma.terceiro.findMany({ where: { empresaId: escopo }, orderBy: { nome: "asc" }, include: { empresa: true } }),
+    prisma.empresa.findMany({ where: { id: escopo }, orderBy: { nome: "asc" } }),
+  ]);
+
+  const terceirosSerializados = terceiros.map((t) => ({
+    id: t.id,
+    empresaId: t.empresaId,
+    nome: t.nome,
+    documento: t.documento,
+    ativo: t.ativo,
+    recebeCestaBasica: t.recebeCestaBasica,
+    recebeValeRefeicao: t.recebeValeRefeicao,
+    valorValeRefeicao: t.valorValeRefeicao?.toNumber() ?? null,
+    recebeCestaComoVR: t.recebeCestaComoVR,
+    recebeValeGas: t.recebeValeGas,
+    valeGasPecunia: t.valeGasPecunia,
+    empresa: { nome: t.empresa.nome },
+  }));
+
+  return (
+    <>
+      <div className="flex flex-col gap-1.5 py-1">
+        <h1 className="font-mono text-[22px] font-bold tracking-[.08em] text-foreground">Terceiros</h1>
+        <p className="font-mono text-[11px] tracking-[.06em] text-text-3">
+          colaboradores terceirizados que não vêm da folha do ERP, mas recebem benefício
+        </p>
+      </div>
+      <TerceirosTable terceiros={terceirosSerializados} empresas={empresas} />
+    </>
+  );
+}

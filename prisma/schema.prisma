@@ -1,0 +1,1065 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id              String    @id
+  name            String
+  email           String
+  emailVerified   Boolean   @default(false)
+  username        String
+  displayUsername String?
+  image           String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  role            String    @default("usuario")
+  // Usuário desativado não consegue entrar (as sessões abertas são encerradas ao desativar).
+  ativo           Boolean   @default(true)
+  // Quando true, o usuário é levado para /trocar-senha antes de usar o sistema.
+  trocarSenha     Boolean   @default(false)
+  sessions        Session[]
+  accounts        Account[]
+  permissoes      UserPermissao[]
+  empresas        UserEmpresa[]
+
+  @@unique([email])
+  @@unique([username])
+  @@map("user")
+}
+
+// Permissão por rotina para usuários não-admin (admin acessa tudo).
+// nivel: "consultar" (ver telas e relatórios) | "operar" (consultar + importar/processar/editar).
+// Sem linha para a rotina = sem acesso.
+model UserPermissao {
+  id     String @id @default(cuid())
+  userId String
+  modulo String
+  nivel  String
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, modulo])
+  @@map("user_permissao")
+}
+
+// Empresas liberadas para usuários não-admin (admin acessa todas). Vale para todas as rotinas:
+// telas, relatórios e importações só mostram/gravam dados dessas empresas.
+// Sem nenhuma linha = nenhuma empresa liberada.
+model UserEmpresa {
+  userId    String
+  empresaId String
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  empresa Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  @@id([userId, empresaId])
+  @@index([empresaId])
+  @@map("user_empresa")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([token])
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+// Trilha de auditoria de ações administrativas (LGPD: dados de RH exigem rastreabilidade de acesso/alteração).
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String
+  action    String
+  targetId  String?
+  metadata  String?
+  createdAt DateTime @default(now())
+
+  @@index([actorId])
+  @@index([createdAt])
+  @@map("audit_log")
+}
+
+// Empresa cliente (o ERP é multi-empresa — código "005" etc. no cabeçalho dos relatórios).
+model Empresa {
+  id        String   @id @default(cuid())
+  codigo    String
+  nome      String
+  // Nome curto pra exibir em gráficos e resumos (ex.: "Pantanal" em vez do nome completo/razão
+  // social). Sugerido automaticamente na importação (primeira palavra do nome), editável.
+  abbr      String?
+  // Dados impressos no Aviso de Férias — preenchidos manualmente na tela de Empresas.
+  cnpj       String?
+  cidadeSede String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Valor unitário da cesta básica; usado para converter em crédito de VR quando o colaborador
+  // opta por "receber a cesta no VR" em vez da cesta física.
+  valorCestaBasica Decimal?
+
+  // --- Regras por empresa -------------------------------------------------------------------
+  // Os padrões abaixo são as regras originais (Pantanal/Rápido/VPAR); empresas que trabalham
+  // diferente (ex.: LOGTRANS) mudam só o que difere, na tela de Empresas.
+
+  // Período de apuração das faltas da cesta básica e do vale gás mensal: null = mês cheio da
+  // competência; um dia (ex.: 21) = do dia 21 do mês anterior ao dia 20 do mês da competência.
+  beneficioPeriodoDiaInicio Int?
+  // Perde cesta básica / vale gás com esta quantidade de faltas OU MAIS (3 = "mais de 2").
+  faltasPerdeBeneficio      Int     @default(3)
+  // false = vale gás bimestral (entrega em mês par, período aquisitivo de ~60 dias de 15 a 14);
+  // true = vale gás todo mês, no mesmo período da cesta básica.
+  valeGasMensal             Boolean @default(false)
+  // Regra combinada de suspensões + faltas no período do vale gás (4 ou mais perde).
+  valeGasRegraSuspensao     Boolean @default(true)
+  // "percentual" = 8% do salário (mín./máx. e valor fixo do cargo); "fixo" = valor fixo da
+  // empresa (vaValorFixo), com exceções por função em vaValoresPorCargo.
+  vaRegra                   String  @default("percentual")
+  vaValorFixo               Decimal?
+  // JSON: [{ "cargo": "MOT RODOVIARIO", "valor": 653.28 }]
+  vaValoresPorCargo         String?
+  // Desligado no mês mantém o VA (proporcional) se o desligamento for a partir deste dia; antes
+  // disso perde. Regra original: 25. LOGTRANS: 31 (quem sai até o dia 30 perde).
+  vaDiaMantemDesligado      Int     @default(25)
+  // Cesta básica de quem é desligado no mês da competência: null = perde (regra original); um dia
+  // (ex.: 28 na LOGTRANS) = quem sai a partir desse dia ainda recebe a cesta física do mês.
+  cestaDiaMantemDesligado   Int?
+  // JSON: [{ "codigo": "0001", "nome": "Cuiabá", "valorValeGas": 117 }] — cidade de cada
+  // funcionário pelo 2º bloco da Divisão da folha (ex.: 0011.0099.0075.0001 → "0099").
+  cidades                   String?
+  // "calculado" = o app recalcula o banco pela regra das empresas originais; "extrato" = usa a
+  // Hora Paga e o Saldo Atual do próprio extrato do ERP (fechamento dentro do mês).
+  bancoHorasModo            String  @default("calculado")
+  // "quinzena" = duas datas de férias por mês (calendário compartilhado); "mensal" = uma data
+  // por mês, calendário próprio da empresa.
+  feriasCalendario          String  @default("quinzena")
+  // Empresa com desoneração da folha (CPRB — Lei 12.546): não paga INSS Patronal (20%) sobre a
+  // folha, paga 1,2% sobre a receita bruta mensal no lugar. Usado no indicador de Custo Mensal do
+  // Empregador pra trocar a rubrica "INSS Patronal" por "CPRB (1,2% receita)" dessas empresas.
+  desoneracaoFolha         Boolean @default(false)
+
+  // Provisão da folha (Análise da Folha → Provisão): alíquotas do INSS da empresa, em %. Folha:
+  // patronal sobre a base INSS da empresa (Pantanal/LOGTRANS 20%; Rápido/VPar 10% na transição da
+  // desoneração) + CPRB sobre a última receita lançada (Rápido/VPar 1,2%) + terceiros + RAT ajustado.
+  provisaoPatronal         Decimal?
+  provisaoCprbReceita      Decimal?
+  provisaoTerceiros        Decimal?
+  provisaoRat              Decimal?
+
+  funcionarios         Funcionario[]
+  terceiros            Terceiro[]
+  importacoes          Importacao[]
+  apuracoes            Apuracao[]
+  apuracoesValeGas     ApuracaoValeGas[]
+  bancoHorasImportacoes BancoHorasImportacao[]
+  folhasPagamento       FolhaPagamento[]
+  consignadoImportacoes ConsignadoImportacao[]
+  pensoes               PensaoAlimenticia[]
+  provisoesRegistradas  ProvisaoRegistrada[]
+  indicadoresMensais   IndicadorMensal[]
+  rateiosTotais        RateioTotalCampo[]
+  operacoesMensais     OperacaoMensal[]
+  usuarios             UserEmpresa[]
+
+  @@unique([codigo])
+  @@map("empresa")
+}
+
+// Cargo = "Função" do relatório de salários. Compartilhado entre empresas (mesma ideia do ERP:
+// "MOTORISTA" é um cargo só, não um por empresa — o salário de fato vive em Funcionario).
+model Cargo {
+  id        String   @id @default(cuid())
+  nome      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Elegibilidade padrão do cargo; Funcionario pode sobrescrever individualmente.
+  recebeCestaBasica  Boolean @default(true)
+  recebeValeRefeicao Boolean @default(true)
+  // Valor fixo de VR do cargo (ex.: motorista = 520) — usado quando o funcionário não tem um
+  // valor individual definido (Funcionario.valorValeRefeicao). Se nenhum dos dois estiver
+  // definido, o VR é calculado como percentual do salário.
+  valorValeRefeicaoFixo Decimal?
+
+  // Sincronizados manualmente via botão na tela de cargos (relatório "Relação Funcionários" do
+  // ERP); nunca sobrescritos automaticamente — divergência do arquivo só é reportada.
+  departamento String?
+  setor        String?
+
+  funcionarios Funcionario[]
+
+  @@unique([nome])
+  @@map("cargo")
+}
+
+model Funcionario {
+  id           String   @id @default(cuid())
+  empresaId    String
+  empresa      Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  matricula    String
+  nome         String
+  // Nome completo vindo do import de situação/VR — separado de `nome` pra não afetar telas
+  // que já usam `nome` (Banco de Horas, Cesta Básica etc.). Usado futuramente pra exportação
+  // de arquivo pro banco.
+  nomeCompleto String?
+  cpf          String?
+  telefone     String?
+  dataAdmissao DateTime
+  cargoId      String
+  cargo        Cargo    @relation(fields: [cargoId], references: [id])
+  salario      Decimal
+
+  // "ativo" | "afastado" | "desligado"
+  status           String    @default("ativo")
+  dataAfastamento  DateTime?
+  dataDesligamento DateTime?
+  // Data do último retorno de afastamento — mantida mesmo depois do status voltar pra "ativo",
+  // pra apuração de benefícios ainda conseguir proporcionalizar o mês em que ele voltou (dias
+  // antes do retorno não contam como trabalhados). Só é relevante enquanto cai dentro do mês da
+  // competência sendo apurada; competências seguintes ignoram esse campo.
+  dataRetorno      DateTime?
+
+  // null = usa o padrão do cargo; true/false = sobrescreve para este funcionário.
+  recebeCestaBasica  Boolean?
+  recebeValeRefeicao Boolean?
+  // null = calculado como percentual do salário; valor definido aqui força um total diferente.
+  valorValeRefeicao  Decimal?
+
+  // Relatório 2 (afastamentos): motivo do afastamento, ex. "Licença sem Remuneração" — usado
+  // na regra de perda de cesta básica quando não completa 28 dias trabalhados no mês.
+  motivoAfastamento String?
+  // Motivo do desligamento vindo do ERP (ex. "TRANSFERENCIA ( COM ONUS )") — usado pra tirar
+  // transferências com ônus do turnover ao montar os indicadores do mês.
+  motivoDesligamento String?
+  // Opção manual: para cálculo do VR, soma 40% ao salário base antes de aplicar o percentual
+  // (colaboradores com gratificação).
+  temGratificacao   Boolean @default(false)
+  // Opção do colaborador: converter o valor da cesta básica em crédito no VR em vez de receber a cesta física.
+  recebeCestaComoVR Boolean @default(false)
+
+  // null = usa o mesmo padrão da cesta básica (recebeCestaBasicaResolvido); true/false sobrescreve
+  // só o vale gás — existe pra quem tem cesta mas não tem vale gás (ou vice-versa).
+  recebeValeGas  Boolean?
+  // Opção manual: recebe o valor da entrega em dinheiro (pecúnia) em vez da quantidade de vale —
+  // poucos casos. O valor pago é o mesmo "valor da entrega" lançado por empresa/competência em
+  // ApuracaoValeGas, não um valor individual.
+  valeGasPecunia Boolean  @default(false)
+
+  // Cidade (só para empresas com Empresa.cidades): preenchida pela Divisão ao importar a folha,
+  // ou manualmente. Define o valor do vale gás.
+  cidade String?
+
+  // Centro de custo = coluna DIVISAO do relatório de Programação de Férias do ERP (gravado na
+  // importação de férias, como vem no arquivo). Impresso no Aviso de Férias.
+  centroCusto String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  faltas Falta[]
+  cats   Cat[]
+
+  bancoHorasSaldoInicial BancoHorasSaldoInicial?
+  bancoHorasApuracoes    BancoHorasApuracao[]
+  bancoHorasLotes        BancoHorasLoteCredito[]
+
+  feriasPeriodos Ferias[]
+
+  afastamentos AfastamentoHistorico[]
+
+  @@unique([empresaId, matricula])
+  @@index([cargoId])
+  @@map("funcionario")
+}
+
+// Histórico completo de afastamentos (pode ter mais de um ciclo no mesmo mês — ex.: voltou dia 7
+// e se afastou de novo dia 23). dataAfastamento/dataRetorno em Funcionario guardam só o ciclo mais
+// recente (pra telas simples de cadastro); a apuração de benefícios usa esta tabela pra contar os
+// dias trabalhados no mês corretamente quando há mais de um ciclo.
+model AfastamentoHistorico {
+  id            String      @id @default(cuid())
+  funcionarioId String
+  funcionario   Funcionario @relation(fields: [funcionarioId], references: [id], onDelete: Cascade)
+  dataInicio    DateTime
+  // null = ainda afastado (ciclo em aberto)
+  dataFim       DateTime?
+  motivo        String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([funcionarioId])
+  @@map("afastamento_historico")
+}
+
+// Relatório 3 (faltas): uma linha por data de falta, não um contador do mês — a data exata é
+// necessária pra apurar qualquer competência retroativa e, futuramente, o período aquisitivo de
+// férias (12 meses corridos desde a admissão, não o mês corrente).
+model Falta {
+  id            String      @id @default(cuid())
+  funcionarioId String
+  funcionario   Funcionario @relation(fields: [funcionarioId], references: [id], onDelete: Cascade)
+  data          DateTime
+  // Sigla da ocorrência vinda do relatório (ATM, FALTA, FALTJ, SUSP etc.). Só "FALTA" (falta sem
+  // justificativa) entra na conta de elegibilidade de cesta básica/VA — as demais são
+  // afastamentos amparados (atestado médico, óbito, suspensão, paternidade, casamento etc.) e
+  // não descontam benefício.
+  ocorrencia    String?
+  createdAt     DateTime    @default(now())
+
+  @@unique([funcionarioId, data])
+  @@index([funcionarioId])
+  @@map("falta")
+}
+
+// Relatório de CAT (Comunicado de Acidente de Trabalho): guardado cru por enquanto, sem indicador
+// nenhum montado em cima ainda — só a base pra quando o dashboard de segurança do trabalho for
+// desenhado. O relatório não traz código de empresa, só matrícula (mesmo casamento por matrícula
+// usado em situação/afastamentos).
+model Cat {
+  id            String      @id @default(cuid())
+  funcionarioId String
+  funcionario   Funcionario @relation(fields: [funcionarioId], references: [id], onDelete: Cascade)
+  dataAcidente  DateTime
+  dataEmissao   DateTime
+  houveAfastamento Boolean
+  // Número do CAT quando o relatório traz (nem toda linha tem — fica null quando ainda não emitido).
+  numeroCat        String?
+  // Código do tipo de acidente (TIPOACIDCAT) tal como vem do relatório — 1, 2, 3... sem tabela de
+  // depara nossa ainda.
+  tipoAcidente     String
+  descricaoAcidente String
+  // "A" | "D" | "F" — situação do funcionário no momento da emissão, como veio no relatório
+  // (pode não bater com o status atual do cadastro).
+  situacaoFuncionario String
+  codSetor            String
+  descSetor           String
+  createdAt           DateTime @default(now())
+
+  @@unique([funcionarioId, dataAcidente])
+  @@index([funcionarioId])
+  @@map("cat")
+}
+
+// Snapshot mensal de indicadores de RH/folha por empresa+área, alimentado pelo PDF "Resumo
+// Gerencial Analítico" do ERP (um snapshot é necessário porque o cadastro de Funcionario só
+// reflete o estado atual — não dá pra reconstruir headcount de um mês passado a partir dele).
+// Campos derivados (custo total do empregador, custo por funcionário, custo total de benefícios,
+// % de encargos sobre a folha, taxa de rotatividade) são calculados na leitura, não guardados aqui.
+model IndicadorMensal {
+  id          String  @id @default(cuid())
+  empresaId   String
+  empresa     Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  competencia String // "mm/yyyy"
+  // "MANUTENCAO" | "ADMINISTRACAO" | "OPERACAO" | "OPERACAO MOTORISTA" — mesmos valores de Cargo.setor
+  setor       String
+
+  ativos     Int
+  admitidos  Int
+  desligados Int
+  afastados  Int
+  // Sem código/linha própria no relatório — preenchidos na importação do Resumo Gerencial a partir
+  // do cadastro (admissão/desligamento de quem tem cargo APRENDIZ), editáveis na conferência.
+  // Descontado de ativos/admitidos/desligados só na hora de calcular turnover.
+  aprendizesAtivos     Int @default(0)
+  aprendizesAdmitidos  Int @default(0)
+  aprendizesDesligados Int @default(0)
+  // Desligados por "TRANSFERENCIA ( COM ONUS )" (relatório de Admitidos/Desligados, coluna Motivo)
+  // — não entram no cálculo de turnover (descontado de `desligados`, mesmo padrão de aprendiz).
+  // Não inclui quem já foi contado em aprendizesDesligados (evita descontar duas vezes a mesma
+  // pessoa).
+  desligadosTransferencia Int @default(0)
+
+  folhaBruta     Decimal
+  liquidoPagar   Decimal
+  // Códigos 00003 + 00659 (hora extra 50%) somados — valor em R$ e a referência em horas.
+  horaExtra      Decimal
+  horaExtraHoras Decimal
+  // Código 00227.
+  comissao Decimal @default(0)
+  // Não vem do PDF nenhum — sempre lançado manualmente (folha processada à parte).
+  folhaSuplementar Decimal @default(0)
+  // Dias de falta (quantidade, campo REFER do código 00508) e atestados (código
+  // 00752), cada um com o valor em R$ descontado por causa deles.
+  faltasDias      Decimal
+  faltasValor     Decimal
+  atestadosDias   Decimal
+  atestadosValor  Decimal
+  // INSS retido do funcionário (não o total patronal+retido) — "INSS Retido dos Funcionarios".
+  inssRetido      Decimal
+  fgts            Decimal
+  // Encargos patronais extraídos do relatório: "INSS da Empresa" (parte patronal), "Acidente de
+  // Trabalho" (RAT/SAT) e "Terceiros" (Sistema S, INCRA, salário educação etc.).
+  // "INSS da Empresa" do relatório — sempre um custo real (não troca de significado conforme a
+  // empresa tem desoneração ou não). 2026-2027: reoneração gradual da folha (Lei 14.973/2024) — as
+  // empresas antes 100% desoneradas voltam a pagar uma fatia do INSS Patronal sobre a folha (10%
+  // em 2026, 15% em 2027) JUNTO com a CPRB (ver cprbDesoneracao abaixo), até 2028 quando volta a
+  // ser 20% sobre a folha sem desoneração nenhuma.
+  inssPatronal      Decimal @default(0)
+  // Só em empresas com desoneração da folha (ver Empresa.desoneracaoFolha): CPRB — 1,2% sobre a
+  // receita bruta mensal (linha "INSS Patronal (Desoneracao)" do relatório), que durante a
+  // reoneração gradual é pago ALÉM do inssPatronal acima, não no lugar dele.
+  cprbDesoneracao   Decimal @default(0)
+  acidenteTrabalho  Decimal @default(0)
+  terceiros         Decimal @default(0)
+  // Descontos por código: 00381 farmácia (nome do fornecedor varia por empresa — ex. "BIG
+  // MASTER" — por isso extraído pelo código, não pelo rótulo), 00492 contribuição confederativa,
+  // 00493 contribuição social (sindical).
+  farmacia                  Decimal @default(0)
+  contribuicaoConfederativa Decimal @default(0)
+  contribuicaoSocial        Decimal @default(0)
+  // O relatório desse mês traz o IRRF sobre férias (código 00481) já da competência corrente,
+  // mas o IRRF normal (código 00453) sai defasado em 1 mês no sistema de origem — por isso os
+  // dois ficam crus aqui, e o IRRF "do mês" exibido no dashboard é montado na leitura somando
+  // irrfFerias da competência atual + irrfNormal da competência ANTERIOR (ver actions.ts).
+  irrfFerias      Decimal
+  irrfNormal      Decimal
+  // Benefícios extraídos do PDF (códigos 00970, 00972, 00971) — o custo total de benefícios é
+  // calculado na leitura somando esses 3 com os 3 abaixo, que não têm código no relatório e
+  // ficam sempre editáveis.
+  cestaBasica     Decimal @default(0)
+  valeGas         Decimal @default(0)
+  valeAlimentacao Decimal @default(0)
+  cafeManha       Decimal @default(0)
+  refeitorio      Decimal @default(0)
+  proSaude        Decimal @default(0)
+
+  // Custo de rotatividade: verbas de rescisão dos desligados do mês (férias indenizadas,
+  // proporcionais, 1/3, 13º proporcional, saldo de salário, VR rescisório — coluna DESLIGADOS do
+  // relatório, ver resumo-gerencial.ts) + um valor manual pra cobrir casos de acordo via CCP/
+  // Reclamatória Trabalhista (código de motivo 22), que saem ZERADOS no relatório porque são pagos
+  // fora da folha. O manual é um total por empresa (não por área), rateado na leitura — mesmo
+  // padrão de proSaude/folhaSuplementar (ver RATEIO_CAMPOS).
+  custoRescisaoAutomatico Decimal @default(0)
+  custoRescisaoManual     Decimal @default(0)
+
+  // Nomes dos campos acima que vieram editados manualmente (o parser não achou no PDF, ou o
+  // usuário corrigiu) — só pra sinalizar na tela, não afeta nenhum cálculo.
+  camposManuais String?
+
+  importadoPorId String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([empresaId, setor, competencia])
+  @@index([empresaId, competencia])
+  @@map("indicador_mensal")
+}
+
+// Valor total mensal de um benefício "sempre editável" (pró-saúde, folha suplementar, café da
+// manhã, refeitório — ver RATEIO_CAMPOS em lib/indicadores.ts), lançado uma vez por empresa (não
+// por área). O rateio por área é feito na leitura: ativos da área / total de ativos da empresa ×
+// este valor (ver carregarIndicadores). Substitui o antigo lançamento manual por área desses
+// campos em IndicadorMensal.
+model RateioTotalCampo {
+  id          String  @id @default(cuid())
+  empresaId   String
+  empresa     Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  competencia String // "mm/yyyy"
+  // Nome do campo de IndicadorMensal que este total rateia (ex.: "proSaude", "folhaSuplementar").
+  campo       String
+  valor       Decimal @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([empresaId, competencia, campo])
+  @@map("rateio_total_campo")
+}
+
+// Km rodado e receita bruta mensal por empresa — base pro indicador de custo/receita por Km
+// rodado (repasse da Prefeitura no transporte é em cima do Km) e pra CPRB das empresas com
+// desoneração da folha (Empresa.desoneracaoFolha). Lançamento manual (não vem de nenhum arquivo
+// do ERP).
+model OperacaoMensal {
+  id          String  @id @default(cuid())
+  empresaId   String
+  empresa     Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  competencia String // "mm/yyyy"
+  kmRodado    Decimal @default(0)
+  receita     Decimal @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([empresaId, competencia])
+  @@map("operacao_mensal")
+}
+
+// Cadastro de terceiros (não vêm da folha do ERP): opção de lançar manualmente e manter
+// recebendo benefício, fora da régua de elegibilidade por cargo/salário dos funcionários.
+model Terceiro {
+  id        String  @id @default(cuid())
+  empresaId String
+  empresa   Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  nome      String
+  documento String?
+  ativo     Boolean @default(true)
+
+  recebeCestaBasica  Boolean  @default(true)
+  recebeValeRefeicao Boolean  @default(false)
+  valorValeRefeicao  Decimal?
+  recebeCestaComoVR  Boolean  @default(false)
+
+  // null = usa o mesmo padrão da cesta básica (recebeCestaBasica); true/false sobrescreve só o
+  // vale gás — existe pra terceiro que tem cesta mas não tem vale gás (ou vice-versa).
+  recebeValeGas  Boolean?
+  // Opção manual: recebe o valor da entrega em dinheiro (pecúnia) em vez da quantidade de vale.
+  valeGasPecunia Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([empresaId])
+  @@map("terceiro")
+}
+
+// Apuração mensal de benefícios (cesta básica + VR) por empresa/competência. Persistida (em vez
+// de recalculada em tempo real) para permitir reabrir o relatório de um mês fechado mesmo depois
+// que a folha seguinte sobrescrever salário/faltas/afastamento dos cadastros de origem.
+model Apuracao {
+  id          String   @id @default(cuid())
+  empresaId   String
+  empresa     Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  competencia String
+  geradoPorId String
+  createdAt   DateTime @default(now())
+
+  // Cesta básica e vale-alimentação fecham em datas diferentes, então cada um tem seu próprio
+  // "processado em" — reprocessar um não mexe no horário do outro.
+  geradoCestaEm DateTime?
+  geradoVrEm    DateTime?
+
+  itens ApuracaoItem[]
+
+  @@unique([empresaId, competencia])
+  @@index([empresaId])
+  @@map("apuracao")
+}
+
+model ApuracaoItem {
+  id         String   @id @default(cuid())
+  apuracaoId String
+  apuracao   Apuracao @relation(fields: [apuracaoId], references: [id], onDelete: Cascade)
+
+  // "funcionario" | "terceiro" — dados abaixo são um snapshot no momento do cálculo, para o
+  // relatório continuar íntegro mesmo se o cadastro de origem mudar ou for removido depois.
+  tipo         String
+  // Id de origem (Funcionario.id ou Terceiro.id) — usado só pra reconciliar a linha entre um
+  // processamento de cesta básica e um de vale-alimentação (datas diferentes), sem depender de
+  // matrícula (terceiro não tem). Null em snapshots antigos, gerados antes dessa separação.
+  funcionarioId String?
+  terceiroId    String?
+  matricula     String?
+  nome          String
+  cargo         String?
+  salario       Decimal?
+  dataAdmissao  DateTime?
+
+  elegivelCestaBasica  Boolean
+  motivoPerdaCesta     String?
+  recebeCestaComoVR    Boolean  @default(false)
+  valorCestaConvertida Decimal?
+
+  elegivelVR    Boolean
+  motivoPerdaVR String?
+  baseCalculoVR Decimal?
+  valorVR       Decimal
+
+  createdAt DateTime @default(now())
+
+  @@unique([apuracaoId, funcionarioId])
+  @@unique([apuracaoId, terceiroId])
+  @@index([apuracaoId])
+  @@map("apuracao_item")
+}
+
+// Vale Gás: benefício com período aquisitivo próprio (~60 dias, de 15 de um mês a 14 do mês
+// dois meses depois), entregue sempre num mês par. Não tem valor fixo por pessoa — o valor de
+// cada entrega varia conforme orçamento, então fica um campo livre preenchido manualmente por
+// competência (em vez de por colaborador).
+model ApuracaoValeGas {
+  id          String   @id @default(cuid())
+  empresaId   String
+  empresa     Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  // Mês de entrega ("mm/yyyy"), sempre um mês par — representa o período aquisitivo de ~60 dias
+  // que termina no dia 14 do mês anterior.
+  competencia String
+  geradoPorId String
+  geradoEm    DateTime?
+  // Valor total dessa entrega (orçamento), opcional — preenchido manualmente depois de apurar
+  // quantos colaboradores têm direito.
+  valorEntrega Decimal?
+  createdAt   DateTime @default(now())
+
+  itens ApuracaoValeGasItem[]
+
+  @@unique([empresaId, competencia])
+  @@index([empresaId])
+  @@map("apuracao_vale_gas")
+}
+
+model ApuracaoValeGasItem {
+  id         String          @id @default(cuid())
+  apuracaoId String
+  apuracao   ApuracaoValeGas @relation(fields: [apuracaoId], references: [id], onDelete: Cascade)
+
+  tipo          String
+  funcionarioId String?
+  terceiroId    String?
+  matricula     String?
+  nome          String
+  cargo         String?
+  dataAdmissao  DateTime?
+
+  elegivel     Boolean
+  motivoPerda  String?
+  // Snapshot da opção de receber em pecúnia no momento do processamento — usado pra montar o
+  // arquivo bancário (o valor pago é o "valor da entrega" da empresa/competência, não um valor
+  // individual).
+  pecunia      Boolean @default(false)
+  // Empresas com valor de vale gás por cidade: snapshot da cidade e do valor unitário. null =
+  // usa o "valor da entrega" da apuração.
+  cidade       String?
+  valor        Decimal?
+
+  createdAt DateTime @default(now())
+
+  @@unique([apuracaoId, funcionarioId])
+  @@unique([apuracaoId, terceiroId])
+  @@index([apuracaoId])
+  @@map("apuracao_vale_gas_item")
+}
+
+// Log de cada importação de arquivo (rastreabilidade + auditoria dos dados de RH). Também é a
+// fonte da checklist "o que já foi importado nesta competência" — um arquivo que cobre várias
+// empresas de uma vez (ex.: situação/vale-refeição) gera uma linha por empresa afetada.
+model Importacao {
+  id             String   @id @default(cuid())
+  empresaId      String
+  empresa        Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  // "cadastro" | "faltas" | "afastamentos" | "movimentacao_aprendiz_desligados" | "ferias" | "cat"
+  // | "indicadores_mensais" — e, de importações antigas, "folha_salarios" | "situacao_vale_refeicao"
+  tipo           String   @default("folha_salarios")
+  importadoPorId String
+  nomeArquivo    String
+  competencia    String
+  criados        Int
+  atualizados    Int
+  naoEncontrados String?
+  createdAt      DateTime @default(now())
+
+  @@index([empresaId])
+  @@index([empresaId, tipo, competencia])
+  @@map("importacao")
+}
+
+// Saldo de abertura do Banco de Horas por funcionário, marco zero = dezembro/2025.
+// Hardcoded manualmente (seed), serve de ponto de partida do motor de cálculo em jan/2026.
+model BancoHorasSaldoInicial {
+  id            String      @id @default(cuid())
+  funcionarioId String      @unique
+  funcionario   Funcionario @relation(fields: [funcionarioId], references: [id], onDelete: Cascade)
+  competencia   String      // sempre "12/2025"
+  saldoDecimal  Decimal     // pode ser negativo, em horas decimais (não HH:MM)
+  createdAt     DateTime    @default(now())
+
+  @@map("banco_horas_saldo_inicial")
+}
+
+// Um registro por funcionário/competência processada — resultado do motor de cálculo.
+// Substituído (não versionado) quando a competência é reimportada, conforme regra (e) do plano.
+model BancoHorasApuracao {
+  id            String      @id @default(cuid())
+  funcionarioId String
+  funcionario   Funcionario @relation(fields: [funcionarioId], references: [id], onDelete: Cascade)
+  competencia   String      // "MM/AAAA"
+
+  creditoBruto   Decimal   // vindo do TXT, em horas decimais
+  debitoBruto    Decimal   // vindo do TXT, em horas decimais
+  creditoLiquido Decimal   // 50% do bruto, arredondado pra cima ao minuto — o que entra no banco
+  pagoNoMes      Decimal   // 50% do bruto (regra a) + expirações de lotes antigos (regra d)
+  saldoPositivo  Decimal   // soma dos lotes de crédito ainda não vencidos/consumidos, ao fechar
+  saldoNegativo  Decimal   // sempre <= 0; valor agregado, sem FIFO
+  saldoFinal     Decimal   // saldoPositivo + saldoNegativo — o que aparece no resumo do mês
+
+  // Funcionário afastado há mais de 30 dias nesta competência: saldoFinal = saldo da competência
+  // anterior, intocado (nenhum crédito gerado, saldo anterior não pago) — ver
+  // src/lib/banco-horas-afastamento.ts. Volta a processar normalmente quando ele retornar.
+  congelado Boolean @default(false)
+
+  // Ajuste manual do DP: o saldo que vem da competência anterior é cancelado na entrada desta
+  // (não é pago aqui nem segue no banco); a competência anterior fica como estava. Preservado nas
+  // reimportações/recálculos — o motor aplica o cancelamento toda vez que reprocessa a série.
+  saldoZeradoManual Boolean @default(false)
+  saldoZeradoMotivo String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([funcionarioId, competencia])
+  @@index([funcionarioId])
+  @@map("banco_horas_apuracao")
+}
+
+// Lotes de crédito individuais (FIFO), para rastrear consumo e vencimento (regra d).
+// Um lote nasce na competência de origem e vence no fechamento da competência seguinte.
+// O saldo de abertura (dez/2025) também entra como um lote, com origem "12/2025".
+model BancoHorasLoteCredito {
+  id                String      @id @default(cuid())
+  funcionarioId     String
+  funcionario       Funcionario @relation(fields: [funcionarioId], references: [id], onDelete: Cascade)
+  competenciaOrigem String      // "MM/AAAA" — mês em que o crédito foi gerado (ou "12/2025" pro saldo inicial)
+  valorOriginal     Decimal
+  valorConsumido    Decimal     @default(0)
+  // "aberto" | "consumido" | "expirado_pago"
+  status            String      @default("aberto")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([funcionarioId, status])
+  @@map("banco_horas_lote_credito")
+}
+
+// Um registro por período aquisitivo de férias de cada funcionário, vindo do relatório
+// "Programação de Férias" do ERP. Reimportar o mesmo período (mesmo funcionário + vencimento)
+// atualiza os dados de origem (faltas, limite etc.) sem apagar a programação já feita manualmente
+// (mês, quinzena, abono) — ver regra de merge em `ferias-actions.ts`.
+model Ferias {
+  id            String      @id @default(cuid())
+  funcionarioId String
+  funcionario   Funcionario @relation(fields: [funcionarioId], references: [id], onDelete: Cascade)
+
+  periodoAquisitivoInicio DateTime // "Aquisição" no relatório
+  periodoAquisitivoFim    DateTime // "Vencimento" — fecha o período aquisitivo
+  dataLimite              DateTime // "Limite" — prazo legal (CLT) pra iniciar o gozo
+  meses                   Int // meses restantes até o limite, no momento da importação (informativo)
+  faltas                  Int      @default(0)
+  // Dias de direito, calculado pela regra de faltas da CLT (0-5=30, 6-14=24, 15-23=18, 24-32=12,
+  // +32=0) — não copiado direto do arquivo, recalculado no import pra sempre bater com a regra.
+  diasDireito             Int
+
+  // Programação (preenchida manualmente na tela, nunca vem do arquivo importado).
+  mes       Int? // 1-12
+  ano       Int?
+  quinzena  Int? // 1 ou 2
+  diasAbono Int     @default(0)
+  // "inicio" | "final"
+  abonoTipo String?
+
+  // Calculados a partir de mes/ano/quinzena/abono ao salvar a programação.
+  gozoInicio    DateTime?
+  gozoFim       DateTime?
+  dataPagamento DateTime?
+
+  // Valor efetivamente pago nessa programação (lançado manualmente após o pagamento) — enquanto
+  // não lançado, o Resumo usa o valor aproximado calculado pela fórmula (salário/30 * dias * 1.333 * 1.2).
+  valorReal Decimal?
+
+  // "pendente" | "programado" | "concluido"
+  status String @default("pendente")
+
+  // Autorização manual pra esse período aparecer no Painel/Mural — algumas programações não devem
+  // ser expostas publicamente (ex.: cargos de confiança, situação ainda não confirmada com o
+  // colaborador). Default true: some do mural só quem for desmarcado explicitamente.
+  exibirMural Boolean @default(true)
+
+  // Alerta manual de que essa programação foi solicitada/confirmada e não deve ser alterada — só
+  // visual (emblema na tela), não bloqueia a edição.
+  travado Boolean @default(false)
+
+  // Aviso de férias enviado pelo WhatsApp (o DP clica, confere e envia manualmente — o sistema só
+  // registra quem confirmou o envio e quando). Volta a null se a programação mudar de data.
+  avisoWhatsappEm  DateTime?
+  avisoWhatsappPor String?
+  // Aviso de Férias assinado pelo colaborador (marcado à mão pelo DP). Também volta a null se a
+  // programação mudar de data — o aviso assinado era das datas antigas.
+  avisoAssinadoEm  DateTime?
+  avisoAssinadoPor String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([funcionarioId, periodoAquisitivoFim])
+  @@index([funcionarioId])
+  @@map("ferias")
+}
+
+// Datas reais de início/fim de cada quinzena (mês/ano/1ª ou 2ª), definidas manualmente pelo RH —
+// não seguem necessariamente dia 1-15/16-fim do mês civil (ex.: fechamento de folha pode ir de
+// 05/01 a 03/02). Usado como referência na tela de calendário e como origem do "Início do gozo" ao
+// programar férias; sem registro aqui, cai no padrão dia 1/dia 16 do mês (ver `calcularDatas`).
+model QuinzenaPeriodo {
+  id         String   @id @default(cuid())
+  // "padrao" = calendário de quinzenas compartilhado (empresas com feriasCalendario "quinzena");
+  // senão, o id da empresa com calendário mensal próprio (uma data por mês, sempre quinzena 1).
+  calendario String   @default("padrao")
+  ano        Int
+  mes        Int // 1-12
+  quinzena   Int // 1 ou 2
+  dataInicio DateTime
+  dataFim    DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([calendario, ano, mes, quinzena])
+  @@map("quinzena_periodo")
+}
+
+// Log de importação do extrato de banco de horas, mesmo padrão de `Importacao` — mas tipado à
+// parte porque o extrato não tem empresaId no cabeçalho de cada bloco (casa só por matrícula).
+model BancoHorasImportacao {
+  id             String   @id @default(cuid())
+  empresaId      String
+  empresa        Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  importadoPorId String
+  nomeArquivo    String
+  periodoInicio  String   // "MM/AAAA"
+  periodoFim     String   // "MM/AAAA"
+  criados        Int
+  atualizados    Int
+  naoEncontrados String?
+  createdAt      DateTime @default(now())
+
+  @@index([empresaId])
+  @@map("banco_horas_importacao")
+}
+
+// Folha de pagamento importada do ERP (relatório "FLP - Folha de Pagamento"), uma por
+// empresa/competência — reimportar substitui. Guarda os eventos de cada funcionário como vieram,
+// e a conferência dos cálculos é refeita na hora de exibir (assim uma regra corrigida vale para
+// os meses já importados). Os meses guardados formam o histórico usado para médias de férias.
+model FolhaPagamento {
+  id             String   @id @default(cuid())
+  empresaId      String
+  empresa        Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  competencia    String   // "MM/AAAA"
+  // "mensal" | "13_1" (13º 1ª parcela) | "13_2" (13º 2ª parcela) — o 13º convive com a folha
+  // mensal da mesma competência sem substituí-la.
+  tipo           String   @default("mensal")
+  // Relatório "simulado" do ERP (antes do fechamento) — a versão definitiva substitui.
+  simulado       Boolean  @default(false)
+  nomeArquivo    String
+  importadoPorId String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  itens FolhaPagamentoItem[]
+
+  @@unique([empresaId, competencia, tipo])
+  @@index([empresaId])
+  @@map("folha_pagamento")
+}
+
+model FolhaPagamentoItem {
+  id          String         @id @default(cuid())
+  folhaId     String
+  folha       FolhaPagamento @relation(fields: [folhaId], references: [id], onDelete: Cascade)
+  matricula   String
+  nome        String
+  funcao      String
+  situacao    String
+  divisao     String
+  salarioBase Decimal
+  admissao    String         // "dd/mm/aaaa"
+  gozoInicio  String?        // "dd/mm/aaaa"
+  gozoFim     String?
+  // JSON com a lista de eventos (código, descrição, coluna, tipo, referência, valor).
+  eventos     String
+
+  @@unique([folhaId, matricula])
+  @@index([folhaId])
+  @@map("folha_pagamento_item")
+}
+
+// Arquivo mensal do e-Consignado (Crédito do Trabalhador) baixado do portal: um contrato por
+// linha com a parcela a descontar na competência. Comparado com o desconto da folha mensal para
+// achar quem ficou com parcela sem desconto (limite de 35%, afastamento, rescisão). Reimportar a
+// mesma empresa/competência substitui.
+model ConsignadoImportacao {
+  id             String   @id @default(cuid())
+  empresaId      String
+  empresa        Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  competencia    String   // "MM/AAAA"
+  // Empregador como veio no arquivo — sai no termo de ciência.
+  razaoSocial    String
+  cnpj           String
+  nomeArquivo    String
+  importadoPorId String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  contratos ConsignadoContrato[]
+
+  @@unique([empresaId, competencia])
+  @@map("consignado_importacao")
+}
+
+model ConsignadoContrato {
+  id               String               @id @default(cuid())
+  importacaoId     String
+  importacao       ConsignadoImportacao @relation(fields: [importacaoId], references: [id], onDelete: Cascade)
+  banco            String
+  contrato         String
+  cpf              String   // só dígitos, 11 posições
+  nome             String
+  inicioDesconto   String   // "MM/AAAA"
+  fimDesconto      String   // "MM/AAAA"
+  totalParcelas    Int
+  valorParcela     Decimal
+  valorEmprestimo  Decimal
+
+  @@index([importacaoId])
+  @@map("consignado_contrato")
+}
+
+// Pensão alimentícia de cada colaborador, cadastrada pelo DP conforme a decisão judicial — usada
+// para conferir o desconto da folha mensal (00469 salário / 00470 férias) e do 13º (00551).
+model PensaoAlimenticia {
+  id           String   @id @default(cuid())
+  empresaId    String
+  empresa      Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  matricula    String
+  nome         String
+  // Um colaborador pode ter mais de uma pensão (ex.: 010004 — 30% do líquido + 50% do mínimo, que o
+  // ERP soma no mesmo evento 00469); a conferência soma todas.
+  beneficiario String?
+  // "salario_minimo" (% do mínimo) | "liquido" (% dos rendimentos líquidos) | "fixo" (valor em R$)
+  modalidade   String
+  percentual   Decimal?
+  valorFixo    Decimal?
+  incide13     Boolean  @default(true)
+  incideFerias Boolean  @default(true)
+  observacao   String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([empresaId, matricula])
+  @@map("pensao_alimenticia")
+}
+
+// Provisão da folha enviada ao financeiro (Análise da Folha → Provisão → "Registrar provisão
+// enviada"): cópia dos valores no momento do envio, para comparar depois com a folha definitiva.
+// Uma por empresa/competência/tipo — registrar de novo substitui (vale a última enviada).
+model ProvisaoRegistrada {
+  id             String   @id @default(cuid())
+  empresaId      String
+  empresa        Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+  competencia    String   // "MM/AAAA"
+  tipo           String   // "mensal" | "13_2"
+  // JSON: valores da provisão (áreas, líquido, pensões, FGTS, consignado, INSS, IR, CPRB), alíquotas,
+  // receita e a base usada (prévia do ERP ou projeção).
+  valores        String
+  registradoPorId   String
+  registradoPorNome String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([empresaId, competencia, tipo])
+  @@map("provisao_registrada")
+}
+
+// Fiscalizações em andamento no DET (Domicílio Eletrônico Trabalhista). O DET não avisa quando o
+// auditor mexe no processo, então o sistema manda e-mail de lembrete às segundas e quintas (08h, 11h,
+// 14h, 17h) até alguém conferir o processo no DET e dar OK aqui. O OK vale até o próximo dia de
+// lembrete; depois o processo volta a ficar pendente até ser encerrado.
+model FiscalizacaoProcesso {
+  id                  String    @id @default(cuid())
+  numero              String
+  assunto             String
+  encerrado           Boolean   @default(false)
+  encerradoEm         DateTime?
+  ultimoOkEm          DateTime?
+  ultimoOkPorNome     String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  conferencias        FiscalizacaoConferencia[]
+
+  @@map("fiscalizacao_processo")
+}
+
+// Histórico de cada OK dado (quem conferiu, quando e o que viu no DET).
+model FiscalizacaoConferencia {
+  id           String   @id @default(cuid())
+  processoId   String
+  processo     FiscalizacaoProcesso @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  usuarioNome  String
+  observacao   String?
+  createdAt    DateTime @default(now())
+
+  @@index([processoId])
+  @@map("fiscalizacao_conferencia")
+}
+
+// Registro de cada tentativa de envio do lembrete. `horario` identifica o horário do dia
+// ("2026-11-24 08h") para não mandar o mesmo lembrete duas vezes.
+model FiscalizacaoAlertaEnvio {
+  id           String   @id @default(cuid())
+  horario      String
+  sucesso      Boolean
+  processos    Int
+  erro         String?
+  createdAt    DateTime @default(now())
+
+  @@index([horario])
+  @@map("fiscalizacao_alerta_envio")
+}
+
+// Configuração do lembrete (linha única, id = "padrao"): os dois e-mails que recebem.
+model FiscalizacaoConfig {
+  id         String   @id
+  email1     String?
+  email2     String?
+  updatedAt  DateTime @updatedAt
+
+  @@map("fiscalizacao_config")
+}

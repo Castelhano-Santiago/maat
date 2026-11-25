@@ -1,0 +1,1852 @@
+"use client";
+
+import { useMemo, useState, useTransition } from "react";
+import { toast } from "sonner";
+import { Download, Printer, CalendarPlus, FileDown, AlertTriangle } from "lucide-react";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import { Button } from "@/components/ui/button";
+import { Tabs, TabsList, TabsTab, TabsIndicator, TabsPanel } from "@/components/ui/tabs";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { salvarProgramacao, salvarQuinzena, alternarExibirMural, alternarTravamento } from "./actions";
+import { Importador } from "./importador";
+import { AvisosWhatsapp } from "./avisos-whatsapp";
+import { usePodeOperar } from "@/components/permissoes-provider";
+import { dataPagamentoFerias } from "@/lib/feriados";
+
+export type QuinzenaLinha = {
+  // "padrao" (quinzenas compartilhadas) ou o id da empresa com calendário mensal.
+  calendario: string;
+  ano: number;
+  mes: number;
+  quinzena: number;
+  dataInicio: string;
+  dataFim: string;
+};
+
+export type FeriasLinha = {
+  id: string;
+  matricula: string;
+  nome: string;
+  funcao: string;
+  departamento: string | null;
+  setor: string | null;
+  empresa: string;
+  // Calendário de férias da empresa: "padrao" (quinzenas) ou o id da empresa com uma data por mês.
+  calendario: string;
+  calendarioMensal: boolean;
+  salario: number;
+  periodoAquisitivoInicio: string;
+  periodoAquisitivoFim: string;
+  dataLimite: string;
+  dataLimiteAjustada: string;
+  diasProrrogadosPorAfastamento: number;
+  meses: number;
+  faltas: number;
+  diasDireito: number;
+  mes: number | null;
+  ano: number | null;
+  quinzena: number | null;
+  diasAbono: number;
+  abonoTipo: "inicio" | "final" | null;
+  gozoInicio: string | null;
+  gozoFim: string | null;
+  dataPagamento: string | null;
+  status: "pendente" | "programado" | "concluido";
+  exibirMural: boolean;
+  valorReal: number | null;
+  travado: boolean;
+  // Aviso de férias pelo WhatsApp
+  nomeCompleto: string;
+  telefone: string | null;
+  // Quantos colaboradores ativos usam esse mesmo celular (0 = sem celular válido).
+  pessoasNoCelular: number;
+  avisoWhatsappEm: string | null;
+  avisoWhatsappPor: string | null;
+  avisoAssinadoEm: string | null;
+  avisoAssinadoPor: string | null;
+  // Afastado(a) no momento (ex.: licença maternidade) — só aparece na lista quem é exceção.
+  afastado: boolean;
+  motivoAfastamento: string | null;
+  // Voltou do afastamento e esse período ainda não tem programação.
+  retornouSemProgramar: boolean;
+};
+
+export type CalendarioFerias = { id: string; nome: string; mensal: boolean };
+
+// "11/2026 1ª" (quinzenas) ou "11/2026" (calendário mensal, uma data por mês).
+function rotuloProgramacao(p: FeriasLinha) {
+  if (!p.mes) return "—";
+  return `${String(p.mes).padStart(2, "0")}/${p.ano}${p.calendarioMensal ? "" : ` ${p.quinzena}ª`}`;
+}
+
+const MESES = [
+  "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+  "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+];
+
+const ANOS = [2026, 2027, 2028, 2029];
+
+function ultimoDiaDoMes(ano: number, mes: number) {
+  return new Date(Date.UTC(ano, mes, 0)).getUTCDate();
+}
+
+function formatarData(iso: string | null) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleDateString("pt-BR", { timeZone: "UTC" });
+}
+
+function formatarMoeda(valor: number) {
+  return valor.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+const CONECTIVOS_NOME = new Set(["de", "da", "do", "dos", "das", "e"]);
+
+// Abrevia nomes do meio pra caber mais linhas na impressão do mural, mantendo primeiro e último nome
+// por extenso — ex.: "Walmir Roberto de Oliveira" -> "Walmir R Oliveira".
+function abreviarNome(nome: string) {
+  const partes = nome.trim().split(/\s+/).filter(Boolean);
+  if (partes.length <= 2) return nome;
+  const primeiro = partes[0];
+  const ultimo = partes[partes.length - 1];
+  const meio = partes
+    .slice(1, -1)
+    .filter((p) => !CONECTIVOS_NOME.has(p.toLowerCase()))
+    .map((p) => p[0].toUpperCase())
+    .join(" ");
+  return meio ? `${primeiro} ${meio} ${ultimo}` : `${primeiro} ${ultimo}`;
+}
+
+function calcularValorAproximado(salario: number, diasGozo: number) {
+  return (salario / 30) * diasGozo * 1.333 * 1.2;
+}
+
+// Usa o valor realmente pago (lançado na programação) quando existir; senão cai no aproximado.
+function valorEfetivo(p: FeriasLinha) {
+  return p.valorReal ?? calcularValorAproximado(p.salario, p.diasDireito - p.diasAbono);
+}
+
+// Ordena por competência programada (ano/mês/quinzena) — quem ainda não tem mês programado vai
+// para o final, em ordem de matrícula.
+function compararCompetencia(a: FeriasLinha, b: FeriasLinha) {
+  if (a.ano !== b.ano) return (a.ano ?? Infinity) - (b.ano ?? Infinity);
+  if (a.mes !== b.mes) return (a.mes ?? Infinity) - (b.mes ?? Infinity);
+  if (a.quinzena !== b.quinzena) return (a.quinzena ?? Infinity) - (b.quinzena ?? Infinity);
+  return a.matricula.localeCompare(b.matricula, "pt-BR", { numeric: true });
+}
+
+function statusBadge(status: "pendente" | "programado" | "concluido") {
+  const cfg = {
+    pendente: { label: "Não programado", letra: "N", cls: "text-text-3 bg-bg-4 border-border" },
+    programado: { label: "Programado", letra: "P", cls: "text-primary bg-accent-glow border-primary/30" },
+    concluido: { label: "Concluído", letra: "C", cls: "text-success bg-success-dim border-success/30" },
+  }[status];
+  return (
+    <span
+      title={cfg.label}
+      className={`inline-flex size-5 items-center justify-center rounded-[3px] border font-mono text-[10px] font-bold uppercase ${cfg.cls}`}
+    >
+      {cfg.letra}
+    </span>
+  );
+}
+
+// -----------------------------------------------------------------------
+// Diálogo de programação — um período por vez, com prévia grande das datas.
+// -----------------------------------------------------------------------
+function ExibirMuralToggle({
+  periodo,
+  onSaved,
+}: {
+  periodo: FeriasLinha;
+  onSaved: (p: FeriasLinha) => void;
+}) {
+  const podeOperar = usePodeOperar("ferias");
+  const [isPending, startTransition] = useTransition();
+
+  function alternar(checked: boolean) {
+    startTransition(async () => {
+      const result = await alternarExibirMural(periodo.id, checked);
+      if (result.error) {
+        toast.error(result.error);
+        return;
+      }
+      onSaved({ ...periodo, exibirMural: checked });
+    });
+  }
+
+  return (
+    <label className="flex cursor-pointer items-center gap-1.5" title="Autoriza esse colaborador a aparecer no Painel/Mural">
+      <input
+        type="checkbox"
+        checked={periodo.exibirMural}
+        disabled={isPending || !podeOperar}
+        onChange={(e) => alternar(e.target.checked)}
+        className="size-3.5 accent-primary"
+      />
+      <span className="font-mono text-[9px] text-text-3">{periodo.exibirMural ? "Sim" : "Não"}</span>
+    </label>
+  );
+}
+
+function TravadoToggle({
+  periodo,
+  onSaved,
+}: {
+  periodo: FeriasLinha;
+  onSaved: (p: FeriasLinha) => void;
+}) {
+  const podeOperar = usePodeOperar("ferias");
+  const [isPending, startTransition] = useTransition();
+
+  function alternar(checked: boolean) {
+    startTransition(async () => {
+      const result = await alternarTravamento(periodo.id, checked);
+      if (result.error) {
+        toast.error(result.error);
+        return;
+      }
+      onSaved({ ...periodo, travado: checked });
+    });
+  }
+
+  return (
+    <label
+      className="flex cursor-pointer items-center gap-1.5"
+      title="Alerta visual de que essa programação foi solicitada/confirmada e não deve ser alterada (não bloqueia a edição)"
+    >
+      <input
+        type="checkbox"
+        checked={periodo.travado}
+        disabled={isPending || !podeOperar}
+        onChange={(e) => alternar(e.target.checked)}
+        className="size-3.5 accent-danger"
+      />
+      <span className="font-mono text-[9px] text-text-3">{periodo.travado ? "Sim" : "Não"}</span>
+    </label>
+  );
+}
+
+function ProgramarDialog({
+  periodo,
+  quinzenas,
+  periodos,
+  onSaved,
+}: {
+  periodo: FeriasLinha;
+  quinzenas: QuinzenaLinha[];
+  periodos: FeriasLinha[];
+  onSaved: (p: FeriasLinha) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [mes, setMes] = useState(periodo.mes ?? 0);
+  const [ano, setAno] = useState(periodo.ano ?? new Date(periodo.dataLimite).getUTCFullYear());
+  // Calendário mensal (ex.: VPAR, LOGTRANS): uma data por mês, sempre "quinzena" 1.
+  const mensal = periodo.calendarioMensal;
+  const [quinzena, setQuinzena] = useState(mensal ? 1 : (periodo.quinzena ?? 0));
+  const [diasAbono, setDiasAbono] = useState(periodo.diasAbono);
+  const [abonoTipo, setAbonoTipo] = useState<"inicio" | "final" | "">(periodo.abonoTipo ?? "");
+  const [valorReal, setValorReal] = useState(periodo.valorReal !== null ? String(periodo.valorReal) : "");
+  const [isPending, startTransition] = useTransition();
+
+  // Período anterior do mesmo colaborador, já programado — usado pelo botão "Repetir programação
+  // anterior" (só mês/quinzena, nunca abono: o colaborador pode não querer vender férias de novo).
+  const periodoAnterior = useMemo(() => {
+    return periodos
+      .filter(
+        (p) =>
+          p.id !== periodo.id &&
+          p.matricula === periodo.matricula &&
+          p.empresa === periodo.empresa &&
+          p.mes &&
+          p.ano &&
+          p.quinzena &&
+          new Date(p.periodoAquisitivoFim).getTime() < new Date(periodo.periodoAquisitivoFim).getTime()
+      )
+      .sort((a, b) => new Date(b.periodoAquisitivoFim).getTime() - new Date(a.periodoAquisitivoFim).getTime())[0];
+  }, [periodos, periodo]);
+
+  function repetirAnterior() {
+    if (!periodoAnterior) return;
+    setMes(periodoAnterior.mes!);
+    setAno(periodo.ano ?? new Date(periodo.dataLimite).getUTCFullYear());
+    setQuinzena(periodoAnterior.quinzena!);
+  }
+
+  const maxAbono = Math.floor(periodo.diasDireito / 3);
+  const diasGozo = periodo.diasDireito - diasAbono;
+
+  const quinzenasDoCalendario = useMemo(() => quinzenas.filter((q) => q.calendario === periodo.calendario), [quinzenas, periodo.calendario]);
+  const quinzenaCustom = quinzenasDoCalendario.find((q) => q.ano === ano && q.mes === mes && q.quinzena === quinzena);
+
+  const gozoInicioPreview = useMemo(() => {
+    if (!mes || !ano || !quinzena) return null;
+    let d: Date;
+    if (quinzenaCustom) {
+      d = new Date(quinzenaCustom.dataInicio);
+    } else {
+      const dia = quinzena === 2 ? 16 : 1;
+      d = new Date(Date.UTC(ano, mes - 1, dia));
+    }
+    if (abonoTipo === "inicio" && diasAbono > 0) d = new Date(d.getTime() + diasAbono * 86_400_000);
+    return d;
+  }, [mes, ano, quinzena, abonoTipo, diasAbono, quinzenaCustom]);
+  const gozoFimPreview = gozoInicioPreview
+    ? new Date(gozoInicioPreview.getTime() + (diasGozo - 1) * 86_400_000)
+    : null;
+  const pagamentoPreview = gozoInicioPreview ? dataPagamentoFerias(gozoInicioPreview) : null;
+
+  const limiteAjustado = new Date(periodo.dataLimiteAjustada);
+  const excedeuLimite = !!(gozoInicioPreview && gozoInicioPreview.getTime() > limiteAjustado.getTime());
+  // Período que já estava vencido antes mesmo dessa edição (ex.: férias atrasadas sendo
+  // regularizadas agora) não trava o Salvar — só avisa. O bloqueio de verdade é só pra evitar
+  // escolher, agora, um mês/quinzena novo que ultrapasse o prazo ainda em aberto.
+  const jaVencido = new Date().getTime() > limiteAjustado.getTime();
+  const bloqueiaSalvar = excedeuLimite && !jaVencido;
+
+  function salvar() {
+    if (!mes || !ano || !quinzena) {
+      toast.error(mensal ? "Escolha o mês e o ano." : "Escolha o mês, o ano e a quinzena.");
+      return;
+    }
+    if (diasAbono > 0 && !abonoTipo) {
+      toast.error("Escolha se o abono fica no início ou no final do período de gozo.");
+      return;
+    }
+    if (bloqueiaSalvar) {
+      toast.error("Início do gozo é depois do limite legal deste colaborador. Escolha um mês/quinzena anterior.");
+      return;
+    }
+    const valorRealNum = valorReal.trim() ? Number(valorReal.replace(",", ".")) : null;
+    if (valorRealNum !== null && (!Number.isFinite(valorRealNum) || valorRealNum < 0)) {
+      toast.error("Valor pago inválido.");
+      return;
+    }
+    startTransition(async () => {
+      const result = await salvarProgramacao({
+        feriasId: periodo.id,
+        mes,
+        ano,
+        quinzena,
+        diasAbono,
+        abonoTipo: diasAbono > 0 ? (abonoTipo || null) : null,
+        valorReal: valorRealNum,
+      });
+      if (result.error) {
+        toast.error(result.error);
+        return;
+      }
+      toast.success(`Programação de ${periodo.nome} salva.`);
+      onSaved({
+        ...periodo,
+        mes,
+        ano,
+        quinzena,
+        diasAbono,
+        abonoTipo: diasAbono > 0 ? (abonoTipo || null) : null,
+        gozoInicio: gozoInicioPreview?.toISOString() ?? null,
+        gozoFim: gozoFimPreview?.toISOString() ?? null,
+        dataPagamento: pagamentoPreview?.toISOString() ?? null,
+        status: "programado",
+        valorReal: valorRealNum,
+      });
+      setOpen(false);
+    });
+  }
+
+  function labelQuinzena(num: 1 | 2) {
+    const custom = mes ? quinzenasDoCalendario.find((q) => q.ano === ano && q.mes === mes && q.quinzena === num) : undefined;
+    if (custom) {
+      return `${num}ª quinzena — ${formatarData(custom.dataInicio)} a ${formatarData(custom.dataFim)}`;
+    }
+    if (num === 1) return "1ª quinzena — dia 01 a 15 (padrão, sem data personalizada)";
+    return mes
+      ? `2ª quinzena — dia 16 a ${ultimoDiaDoMes(ano, mes)} (padrão, sem data personalizada)`
+      : "2ª quinzena — dia 16 ao fim do mês";
+  }
+  const labelQuinzena1 = labelQuinzena(1);
+  const labelQuinzena2 = labelQuinzena(2);
+
+  const selectCls =
+    "h-9 w-full rounded-sm border border-border-hi bg-secondary px-2.5 font-mono text-[12px] text-foreground outline-none focus-visible:border-primary";
+  const labelCls = "mb-1 block font-mono text-[10px] font-bold tracking-[.06em] text-text-3 uppercase";
+
+  function handleOpenChange(v: boolean) {
+    if (v) {
+      // Sempre parte dos dados salvos mais recentes ao abrir — evita mostrar uma edição antiga
+      // que foi cancelada numa sessão anterior sem ter sido salva.
+      setMes(periodo.mes ?? 0);
+      setAno(periodo.ano ?? new Date(periodo.dataLimite).getUTCFullYear());
+      setQuinzena(mensal ? 1 : (periodo.quinzena ?? 0));
+      setDiasAbono(periodo.diasAbono);
+      setAbonoTipo(periodo.abonoTipo ?? "");
+      setValorReal(periodo.valorReal !== null ? String(periodo.valorReal) : "");
+    }
+    setOpen(v);
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogTrigger
+        render={
+          <Button size="sm" variant={periodo.gozoInicio ? "secondary" : "default"}>
+            <CalendarPlus className="size-3.5" />
+            {periodo.gozoInicio ? "Editar" : "Programar"}
+          </Button>
+        }
+      />
+      <DialogContent className="flex max-h-[85vh] flex-col sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Programar férias — {periodo.nome}</DialogTitle>
+          <DialogDescription>
+            Período aquisitivo:{" "}
+            <span className="font-bold text-foreground">
+              {formatarData(periodo.periodoAquisitivoInicio)} a {formatarData(periodo.periodoAquisitivoFim)}
+            </span>
+            <br />
+            Matrícula {periodo.matricula} · {periodo.funcao} · {periodo.faltas} falta(s) no período →{" "}
+            <span className="font-bold text-primary">{periodo.diasDireito} dias de direito</span> · limite para
+            iniciar o gozo:{" "}
+            <span className="font-bold text-foreground">{formatarData(periodo.dataLimiteAjustada)}</span>
+            {periodo.diasProrrogadosPorAfastamento > 0 && (
+              <span className="text-warning">
+                {" "}
+                (prazo original {formatarData(periodo.dataLimite)}, prorrogado {periodo.diasProrrogadosPorAfastamento}{" "}
+                dia(s) por afastamento dentro do período concessivo)
+              </span>
+            )}
+            {periodo.gozoInicio && (
+              <>
+                <br />
+                Já programado — pode alterar mês, quinzena e abono quantas vezes precisar, é só salvar de novo.
+              </>
+            )}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-1">
+          {periodoAnterior && (
+            <Button type="button" size="sm" variant="secondary" onClick={repetirAnterior}>
+              <CalendarPlus className="size-3.5" />
+              Repetir programação anterior ({rotuloProgramacao(periodoAnterior)})
+            </Button>
+          )}
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className={labelCls}>Mês de férias</label>
+              <select className={selectCls} value={mes} onChange={(e) => setMes(Number(e.target.value))}>
+                <option value={0}>Selecione...</option>
+                {MESES.map((m, i) => (
+                  <option key={m} value={i + 1}>{m}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className={labelCls}>Ano</label>
+              <select className={selectCls} value={ano} onChange={(e) => setAno(Number(e.target.value))}>
+                {ANOS.map((a) => (
+                  <option key={a} value={a}>{a}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {mensal ? (
+            <div>
+              <label className={labelCls}>Data de férias do mês</label>
+              <p className="rounded-sm border border-border-hi bg-secondary px-3 py-2.5 font-mono text-[11px] text-text-2">
+                {!mes
+                  ? "Escolha o mês para ver a data."
+                  : quinzenaCustom
+                    ? `${formatarData(quinzenaCustom.dataInicio)} a ${formatarData(quinzenaCustom.dataFim)} (calendário da empresa)`
+                    : "Dia 01 (padrão — a data deste mês ainda não foi cadastrada no Calendário da empresa)"}
+              </p>
+            </div>
+          ) : (
+          <div>
+            <label className={labelCls}>Quinzena</label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setQuinzena(1)}
+                className={`rounded-sm border px-3 py-2.5 text-left font-mono text-[11px] transition-colors ${
+                  quinzena === 1
+                    ? "border-primary bg-accent-glow text-primary"
+                    : "border-border-hi bg-secondary text-text-2 hover:border-primary/50"
+                }`}
+              >
+                {labelQuinzena1}
+              </button>
+              <button
+                type="button"
+                onClick={() => setQuinzena(2)}
+                className={`rounded-sm border px-3 py-2.5 text-left font-mono text-[11px] transition-colors ${
+                  quinzena === 2
+                    ? "border-primary bg-accent-glow text-primary"
+                    : "border-border-hi bg-secondary text-text-2 hover:border-primary/50"
+                }`}
+              >
+                {labelQuinzena2}
+              </button>
+            </div>
+          </div>
+          )}
+
+          <div>
+            <label className={labelCls}>Abono pecuniário (venda de até 1/3 das férias)</label>
+            <div className="grid grid-cols-2 gap-3">
+              <select
+                className={selectCls}
+                value={diasAbono}
+                onChange={(e) => setDiasAbono(Number(e.target.value))}
+              >
+                <option value={0}>Sem abono</option>
+                {maxAbono >= 10 && <option value={10}>10 dias de abono</option>}
+              </select>
+              <select
+                className={selectCls}
+                value={abonoTipo}
+                disabled={diasAbono === 0}
+                onChange={(e) => setAbonoTipo(e.target.value as "inicio" | "final" | "")}
+              >
+                <option value="">Início ou final?</option>
+                <option value="inicio">No início do gozo</option>
+                <option value="final">No final do gozo</option>
+              </select>
+            </div>
+          </div>
+
+          <div
+            className={`rounded-lg border p-4 ${
+              !excedeuLimite
+                ? "border-primary/30 bg-accent-glow"
+                : bloqueiaSalvar
+                  ? "border-danger/40 bg-danger/10"
+                  : "border-warning/40 bg-warning/10"
+            }`}
+          >
+            <p
+              className={`mb-3 font-mono text-[10px] font-bold tracking-[.06em] uppercase ${
+                !excedeuLimite ? "text-primary" : bloqueiaSalvar ? "text-danger" : "text-warning"
+              }`}
+            >
+              Prévia da programação
+            </p>
+            {excedeuLimite && bloqueiaSalvar && (
+              <p className="mb-3 font-mono text-[11px] font-bold text-danger">
+                Início do gozo passa do limite legal ({formatarData(periodo.dataLimiteAjustada)}) — escolha um
+                mês/quinzena anterior.
+              </p>
+            )}
+            {excedeuLimite && !bloqueiaSalvar && (
+              <p className="mb-3 font-mono text-[11px] font-bold text-warning">
+                Este período já está vencido desde {formatarData(periodo.dataLimiteAjustada)} — pode salvar mesmo
+                assim pra regularizar a programação em atraso.
+              </p>
+            )}
+            {gozoInicioPreview && gozoFimPreview ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex items-baseline justify-between">
+                  <span className="font-mono text-[11px] text-text-2">Início do gozo</span>
+                  <span className="font-mono text-lg font-bold text-foreground">
+                    {gozoInicioPreview.toLocaleDateString("pt-BR", { timeZone: "UTC" })}
+                  </span>
+                </div>
+                <div className="flex items-baseline justify-between">
+                  <span className="font-mono text-[11px] text-text-2">Fim do gozo</span>
+                  <span className="font-mono text-lg font-bold text-foreground">
+                    {gozoFimPreview.toLocaleDateString("pt-BR", { timeZone: "UTC" })}
+                  </span>
+                </div>
+                <div className="my-1 h-px bg-primary/20" />
+                <div className="flex items-baseline justify-between">
+                  <span className="font-mono text-[11px] text-text-2">Dias de gozo</span>
+                  <span className="font-mono text-[13px] font-bold text-foreground">{diasGozo} dias</span>
+                </div>
+                <div className="flex items-baseline justify-between">
+                  <span className="font-mono text-[11px] text-text-2">Pagar até</span>
+                  <span className="font-mono text-[13px] font-bold text-foreground">
+                    {pagamentoPreview?.toLocaleDateString("pt-BR", { timeZone: "UTC" })}
+                  </span>
+                </div>
+                <div className="flex items-baseline justify-between">
+                  <span className="font-mono text-[11px] text-text-2">Valor aproximado</span>
+                  <span className="font-mono text-[13px] font-bold text-foreground">
+                    {formatarMoeda(calcularValorAproximado(periodo.salario, diasGozo))}
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <p className="font-mono text-[11px] text-text-3">
+                {mensal ? "Escolha o mês e o ano para ver as datas." : "Escolha o mês, ano e quinzena para ver as datas."}
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-1.5 border-t border-border pt-3">
+          <label htmlFor="valorReal" className={labelCls}>
+            Valor real pago (opcional)
+          </label>
+          <input
+            id="valorReal"
+            type="text"
+            inputMode="decimal"
+            placeholder="ex.: 4190,77 — deixe em branco se ainda não foi pago"
+            value={valorReal}
+            onChange={(e) => setValorReal(e.target.value)}
+            className={selectCls}
+          />
+          <p className="font-mono text-[10px] text-text-3">
+            Enquanto não for lançado, o Resumo usa o valor aproximado calculado pela fórmula.
+          </p>
+        </div>
+
+        <div className="flex items-center justify-between border-t border-border pt-3">
+          <span className="font-mono text-[11px] text-text-2">Exibir no Painel/Mural</span>
+          <ExibirMuralToggle periodo={periodo} onSaved={onSaved} />
+        </div>
+
+        <div className="flex items-center justify-between border-t border-border pt-3">
+          <span className="font-mono text-[11px] text-text-2">
+            Travar (programação solicitada — não deve ser alterada)
+          </span>
+          <TravadoToggle periodo={periodo} onSaved={onSaved} />
+        </div>
+        {periodo.travado && (
+          <p className="-mt-2 flex items-center gap-1.5 font-mono text-[10px] font-bold text-danger">
+            <AlertTriangle className="size-3 shrink-0" />
+            Esta programação está marcada como travada — alterar aqui ainda é permitido, apenas confirme
+            com quem solicitou antes de salvar.
+          </p>
+        )}
+
+        <DialogFooter>
+          <Button variant="secondary" onClick={() => setOpen(false)} disabled={isPending}>
+            Cancelar
+          </Button>
+          <Button onClick={salvar} disabled={isPending || bloqueiaSalvar}>
+            {isPending ? "Salvando..." : "Salvar programação"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// -----------------------------------------------------------------------
+// Calendário de quinzenas — referência fixa de datas por mês/ano.
+// -----------------------------------------------------------------------
+function dataParaInput(iso: string) {
+  return iso.slice(0, 10);
+}
+
+function QuinzenaCelulaEditavel({
+  calendario,
+  mensal,
+  ano,
+  mes,
+  quinzena,
+  custom,
+  onSaved,
+}: {
+  calendario: string;
+  mensal: boolean;
+  ano: number;
+  mes: number;
+  quinzena: 1 | 2;
+  custom: QuinzenaLinha | undefined;
+  onSaved: (q: QuinzenaLinha) => void;
+}) {
+  const padraoInicio = custom
+    ? custom.dataInicio
+    : new Date(Date.UTC(ano, mes - 1, quinzena === 2 ? 16 : 1)).toISOString();
+  // Calendário mensal: padrão = mês inteiro.
+  const padraoFim = custom
+    ? custom.dataFim
+    : new Date(Date.UTC(ano, mes - 1, quinzena === 2 || mensal ? ultimoDiaDoMes(ano, mes) : 15)).toISOString();
+
+  const podeOperar = usePodeOperar("ferias");
+  const [dataInicio, setDataInicio] = useState(dataParaInput(padraoInicio));
+  const [dataFim, setDataFim] = useState(dataParaInput(padraoFim));
+  const [isPending, startTransition] = useTransition();
+
+  function alterarInicio(novoInicio: string) {
+    setDataInicio(novoInicio);
+    // Sempre que o início muda, recalcula o fim automaticamente pra um ciclo de 30 dias corridos
+    // (05/01 → 03/02, por exemplo) — ainda dá pra ajustar o fim manualmente depois, se precisar.
+    const d = new Date(novoInicio + "T00:00:00.000Z");
+    if (!Number.isNaN(d.getTime())) {
+      setDataFim(dataParaInput(new Date(d.getTime() + 29 * 86_400_000).toISOString()));
+    }
+  }
+
+  const pagamento = (() => {
+    const d = new Date(dataInicio + "T00:00:00.000Z");
+    if (Number.isNaN(d.getTime())) return null;
+    return dataPagamentoFerias(d);
+  })();
+
+  function salvar() {
+    startTransition(async () => {
+      const result = await salvarQuinzena({
+        calendario,
+        ano,
+        mes,
+        quinzena,
+        dataInicio: new Date(dataInicio + "T00:00:00.000Z").toISOString(),
+        dataFim: new Date(dataFim + "T00:00:00.000Z").toISOString(),
+      });
+      if (result.error) {
+        toast.error(result.error);
+        return;
+      }
+      toast.success(mensal ? `Data de ${MESES[mes - 1]}/${ano} salva.` : `${quinzena}ª quinzena de ${MESES[mes - 1]}/${ano} salva.`);
+      onSaved({
+        calendario,
+        ano,
+        mes,
+        quinzena,
+        dataInicio: new Date(dataInicio + "T00:00:00.000Z").toISOString(),
+        dataFim: new Date(dataFim + "T00:00:00.000Z").toISOString(),
+      });
+    });
+  }
+
+  const inputCls =
+    "h-7 rounded-sm border border-border-hi bg-secondary px-1.5 font-mono text-[10px] text-foreground outline-none focus-visible:border-primary";
+
+  if (!podeOperar) {
+    return (
+      <div className="flex flex-col gap-1 font-mono text-[10px] text-foreground">
+        <span>
+          {formatarData(padraoInicio)} a {formatarData(padraoFim)}
+          {!custom && <span className="ml-1.5 text-[9px] text-text-3">(padrão)</span>}
+        </span>
+        {pagamento && (
+          <span className="text-[9px] text-text-3">
+            pagar até {pagamento.toLocaleDateString("pt-BR", { timeZone: "UTC" })} (dia útil)
+          </span>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1.5">
+        <input type="date" className={inputCls} value={dataInicio} onChange={(e) => alterarInicio(e.target.value)} />
+        <span className="text-text-3">a</span>
+        <input type="date" className={inputCls} value={dataFim} onChange={(e) => setDataFim(e.target.value)} />
+        <Button size="xs" variant="secondary" onClick={salvar} disabled={isPending}>
+          {isPending ? "..." : "Salvar"}
+        </Button>
+        {!custom && <span className="font-mono text-[9px] text-text-3">(padrão)</span>}
+      </div>
+      {pagamento && (
+        <span className="font-mono text-[9px] text-text-3">
+          pagar até {pagamento.toLocaleDateString("pt-BR", { timeZone: "UTC" })} (dia útil)
+        </span>
+      )}
+    </div>
+  );
+}
+
+function CalendarioQuinzenas({
+  quinzenas,
+  calendarios,
+  onSaved,
+}: {
+  quinzenas: QuinzenaLinha[];
+  calendarios: CalendarioFerias[];
+  onSaved: (q: QuinzenaLinha) => void;
+}) {
+  const [ano, setAno] = useState(new Date().getFullYear());
+  // Cada empresa segue o seu calendário: quinzenas (compartilhado) ou uma data por mês (próprio).
+  const [calendarioId, setCalendarioId] = useState(calendarios[0]?.id ?? "padrao");
+  const calendario = calendarios.find((c) => c.id === calendarioId) ?? { id: "padrao", nome: "Quinzenas", mensal: false };
+  const doCalendario = quinzenas.filter((q) => q.calendario === calendario.id);
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-2.5">
+        <label className="font-mono text-[11px] text-text-3">Calendário:</label>
+        <select
+          className="h-8 rounded-sm border border-border-hi bg-secondary px-2 font-mono text-[11px] text-foreground"
+          value={calendario.id}
+          onChange={(e) => setCalendarioId(e.target.value)}
+        >
+          {calendarios.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.nome}
+              {c.mensal ? " (uma data por mês)" : ""}
+            </option>
+          ))}
+        </select>
+        <label className="font-mono text-[11px] text-text-3">Ano:</label>
+        <select
+          className="h-8 rounded-sm border border-border-hi bg-secondary px-2 font-mono text-[11px] text-foreground"
+          value={ano}
+          onChange={(e) => setAno(Number(e.target.value))}
+        >
+          {ANOS.map((a) => (
+            <option key={a} value={a}>{a}</option>
+          ))}
+        </select>
+        <p className="font-mono text-[10px] text-text-3">
+          {calendario.mensal
+            ? "edite a data de férias de cada mês e clique em Salvar — quem não editar continua usando o padrão (mês inteiro)"
+            : "edite as datas de início/fim de cada quinzena e clique em Salvar — quem não editar continua usando o padrão (dia 1 a 15 / dia 16 ao fim do mês)"}
+        </p>
+        <a
+          href={`/admin/ferias/calendario-pdf?ano=${ano}&calendario=${encodeURIComponent(calendario.id)}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="ml-auto"
+        >
+          <Button size="xs" variant="secondary">
+            <FileDown className="size-3" />
+            Imprimir
+          </Button>
+        </a>
+      </div>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Mês</TableHead>
+            <TableHead>{calendario.mensal ? "Data de férias" : "1ª Quinzena"}</TableHead>
+            {!calendario.mensal && <TableHead>2ª Quinzena</TableHead>}
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {MESES.map((nome, i) => {
+            const mes = i + 1;
+            const custom1 = doCalendario.find((q) => q.ano === ano && q.mes === mes && q.quinzena === 1);
+            const custom2 = doCalendario.find((q) => q.ano === ano && q.mes === mes && q.quinzena === 2);
+            return (
+              <TableRow key={`${calendario.id}-${ano}-${nome}`}>
+                <TableCell className="font-medium text-foreground capitalize whitespace-nowrap">{nome}</TableCell>
+                <TableCell>
+                  <QuinzenaCelulaEditavel
+                    calendario={calendario.id}
+                    mensal={calendario.mensal}
+                    ano={ano}
+                    mes={mes}
+                    quinzena={1}
+                    custom={custom1}
+                    onSaved={onSaved}
+                  />
+                </TableCell>
+                {!calendario.mensal && (
+                  <TableCell>
+                    <QuinzenaCelulaEditavel calendario={calendario.id} mensal={false} ano={ano} mes={mes} quinzena={2} custom={custom2} onSaved={onSaved} />
+                  </TableCell>
+                )}
+              </TableRow>
+            );
+          })}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
+
+function baixarCsv(nomeArquivo: string, cabecalho: string[], linhas: string[][]) {
+  const conteudo = [cabecalho, ...linhas]
+    .map((l) => l.map((c) => `"${c.replace(/"/g, '""')}"`).join(";"))
+    .join("\r\n");
+  const blob = new Blob(["﻿" + conteudo], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = nomeArquivo;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+const COR_PROGRAMADOS = "#0d9488";
+const COR_VALOR = "#3b82f6";
+const TOOLTIP_STYLE = {
+  background: "#131619",
+  border: "1px solid #2a3038",
+  borderRadius: 6,
+  fontFamily: "var(--font-mono)",
+  fontSize: 11,
+  color: "#e2e8f0",
+};
+
+type Filtro = {
+  empresa: string;
+  area: string;
+  departamento: string;
+  mes: number;
+  ano: number;
+  quinzena: number;
+};
+
+function useFiltro(base: FeriasLinha[], anoInicial = 0) {
+  const [empresa, setEmpresa] = useState("");
+  const [area, setArea] = useState("");
+  const [departamento, setDepartamento] = useState("");
+  const [mes, setMes] = useState(0);
+  const [ano, setAno] = useState(anoInicial);
+  const [quinzena, setQuinzena] = useState(0);
+  const filtrados = useMemo(
+    () =>
+      base.filter(
+        (p) =>
+          (!empresa || p.empresa === empresa) &&
+          (!area || (p.setor ?? "Não classificado") === area) &&
+          (!departamento || (p.departamento ?? "Não classificado") === departamento) &&
+          (!mes || p.mes === mes) &&
+          (!ano || p.ano === ano) &&
+          (!quinzena || p.quinzena === quinzena)
+      ),
+    [base, empresa, area, departamento, mes, ano, quinzena]
+  );
+  return {
+    empresa,
+    setEmpresa,
+    area,
+    setArea,
+    departamento,
+    setDepartamento,
+    mes,
+    setMes,
+    ano,
+    setAno,
+    quinzena,
+    setQuinzena,
+    filtrados,
+  };
+}
+
+function FiltroBar({
+  empresas,
+  areas,
+  departamentos,
+  filtro,
+  mostrarDepartamento = false,
+  mostrarAno = false,
+  mostrarQuinzena = false,
+}: {
+  empresas: string[];
+  areas: string[];
+  departamentos?: string[];
+  filtro: Filtro & {
+    setEmpresa: (v: string) => void;
+    setArea: (v: string) => void;
+    setDepartamento: (v: string) => void;
+    setMes: (v: number) => void;
+    setAno: (v: number) => void;
+    setQuinzena: (v: number) => void;
+  };
+  mostrarDepartamento?: boolean;
+  mostrarAno?: boolean;
+  mostrarQuinzena?: boolean;
+}) {
+  const selectCls =
+    "h-8 rounded-sm border border-border-hi bg-secondary px-2 font-mono text-[11px] text-foreground outline-none focus-visible:border-primary";
+  return (
+    <div className="flex flex-wrap items-center gap-2 print:hidden">
+      <select className={selectCls} value={filtro.empresa} onChange={(e) => filtro.setEmpresa(e.target.value)}>
+        <option value="">Todas as empresas</option>
+        {empresas.map((e) => (
+          <option key={e} value={e}>{e}</option>
+        ))}
+      </select>
+      <select className={selectCls} value={filtro.area} onChange={(e) => filtro.setArea(e.target.value)}>
+        <option value="">Todas as áreas</option>
+        {areas.map((a) => (
+          <option key={a} value={a}>{a}</option>
+        ))}
+      </select>
+      {mostrarDepartamento && (
+        <select
+          className={selectCls}
+          value={filtro.departamento}
+          onChange={(e) => filtro.setDepartamento(e.target.value)}
+        >
+          <option value="">Todos os departamentos</option>
+          {(departamentos ?? []).map((d) => (
+            <option key={d} value={d}>{d}</option>
+          ))}
+        </select>
+      )}
+      <select className={selectCls} value={filtro.mes} onChange={(e) => filtro.setMes(Number(e.target.value))}>
+        <option value={0}>Todos os meses</option>
+        {MESES.map((m, i) => (
+          <option key={m} value={i + 1}>{m}</option>
+        ))}
+      </select>
+      {mostrarQuinzena && (
+        <select
+          className={selectCls}
+          value={filtro.quinzena}
+          onChange={(e) => filtro.setQuinzena(Number(e.target.value))}
+        >
+          <option value={0}>Ambas quinzenas</option>
+          <option value={1}>1ª quinzena</option>
+          <option value={2}>2ª quinzena</option>
+        </select>
+      )}
+      {mostrarAno && (
+        <select className={selectCls} value={filtro.ano} onChange={(e) => filtro.setAno(Number(e.target.value))}>
+          <option value={0}>Todos os anos</option>
+          {ANOS.map((a) => (
+            <option key={a} value={a}>{a}</option>
+          ))}
+        </select>
+      )}
+    </div>
+  );
+}
+
+export function FeriasTable({
+  periodos: periodosIniciais,
+  quinzenasIniciais,
+  calendarios,
+}: {
+  periodos: FeriasLinha[];
+  quinzenasIniciais: QuinzenaLinha[];
+  calendarios: CalendarioFerias[];
+}) {
+  const podeOperar = usePodeOperar("ferias");
+  const [periodos, setPeriodos] = useState(periodosIniciais);
+  const [quinzenas, setQuinzenas] = useState(quinzenasIniciais);
+
+  function atualizarPeriodo(atualizado: FeriasLinha) {
+    setPeriodos((prev) => prev.map((p) => (p.id === atualizado.id ? atualizado : p)));
+  }
+
+  function atualizarQuinzena(atualizada: QuinzenaLinha) {
+    setQuinzenas((prev) => {
+      const mesma = (q: QuinzenaLinha) =>
+        q.calendario === atualizada.calendario && q.ano === atualizada.ano && q.mes === atualizada.mes && q.quinzena === atualizada.quinzena;
+      if (prev.some(mesma)) {
+        return prev.map((q) => (mesma(q) ? atualizada : q));
+      }
+      return [...prev, atualizada];
+    });
+  }
+
+  const programados = periodos.filter((p) => !!p.gozoInicio);
+  const alertaVencendo = periodos.filter((p) => !p.gozoInicio && p.meses >= 21);
+  const naoProgramados = periodos.filter((p) => !p.gozoInicio);
+  const retornadosSemProgramar = periodos.filter((p) => p.retornouSemProgramar);
+
+  const [busca, setBusca] = useState("");
+  const [filtroStatus, setFiltroStatus] = useState<"todos" | "programados" | "nao-programados">("todos");
+  const filtroProgramacao = useFiltro(periodos);
+  const periodosFiltrados = useMemo(() => {
+    const termo = busca.trim().toLowerCase();
+    let base = termo
+      ? filtroProgramacao.filtrados.filter(
+          (p) => p.matricula.toLowerCase().includes(termo) || p.nome.toLowerCase().includes(termo)
+        )
+      : filtroProgramacao.filtrados;
+    if (filtroStatus === "programados") base = base.filter((p) => !!p.gozoInicio);
+    if (filtroStatus === "nao-programados") base = base.filter((p) => !p.gozoInicio);
+    return [...base].sort(compararCompetencia);
+  }, [filtroProgramacao.filtrados, busca, filtroStatus]);
+
+  // Programados por área/quinzena dentro do filtro atual — ajuda a controlar limites por área
+  // (ex.: quantidade máxima de motoristas programados ao mesmo tempo) enquanto se está programando.
+  const programadosPorAreaQuinzena = useMemo(() => {
+    const mapa = new Map<string, { q1: number; q2: number }>();
+    for (const p of periodosFiltrados) {
+      if (!p.gozoInicio || !p.quinzena) continue;
+      const chave = p.setor ?? "Não classificado";
+      const atual = mapa.get(chave) ?? { q1: 0, q2: 0 };
+      if (p.quinzena === 1) atual.q1++;
+      else atual.q2++;
+      mapa.set(chave, atual);
+    }
+    return [...mapa.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [periodosFiltrados]);
+
+  const empresas = useMemo(() => [...new Set(periodos.map((p) => p.empresa))].sort(), [periodos]);
+  const areas = useMemo(
+    () => [...new Set(periodos.map((p) => p.setor ?? "Não classificado"))].sort(),
+    [periodos]
+  );
+  const departamentos = useMemo(
+    () => [...new Set(periodos.map((p) => p.departamento ?? "Não classificado"))].sort(),
+    [periodos]
+  );
+
+  const autorizadosMural = useMemo(() => programados.filter((p) => p.exibirMural), [programados]);
+  const filtroMural = useFiltro(autorizadosMural, new Date().getFullYear());
+  const muralOrdenado = useMemo(
+    () => [...filtroMural.filtrados].sort((a, b) => a.matricula.localeCompare(b.matricula, "pt-BR", { numeric: true })),
+    [filtroMural.filtrados]
+  );
+  const empresaMural = useMemo(() => {
+    if (filtroMural.empresa) return filtroMural.empresa;
+    const empresasNoFiltro = new Set(filtroMural.filtrados.map((p) => p.empresa));
+    if (empresasNoFiltro.size === 1) return [...empresasNoFiltro][0];
+    return "Todas as empresas";
+  }, [filtroMural.empresa, filtroMural.filtrados]);
+  // Fonte do mural se ajusta à quantidade de linhas: quanto menos gente, maior a letra — sempre
+  // ocupando o espaço da página sem nunca estourar para uma 2ª folha. Nome e Departamento têm largura
+  // travada (table-fixed) e podem quebrar em 2 linhas; as colunas de data (Mês/Início/Final) NÃO quebram,
+  // então a fonte delas precisa caber em 1 linha na largura reservada — por isso o teto é mais baixo
+  // que o das colunas que quebram.
+  const muralTamanho = useMemo(() => {
+    const n = muralOrdenado.length;
+    if (n <= 8) return { tabela: "print:text-xl", cabecalho: "print:text-sm", linhaPy: "print:py-1" };
+    if (n <= 12) return { tabela: "print:text-lg", cabecalho: "print:text-sm", linhaPy: "print:py-0.5" };
+    if (n <= 17) return { tabela: "print:text-base", cabecalho: "print:text-xs", linhaPy: "print:py-0.5" };
+    if (n <= 24) return { tabela: "print:text-sm", cabecalho: "print:text-xs", linhaPy: "print:py-0.5" };
+    if (n <= 32) return { tabela: "print:text-xs", cabecalho: "print:text-xs", linhaPy: "print:py-0" };
+    return { tabela: "print:text-[10px]", cabecalho: "print:text-[10px]", linhaPy: "print:py-0" };
+  }, [muralOrdenado]);
+  const filtroResumo = useFiltro(periodos);
+  const [resumoMesInicio, setResumoMesInicio] = useState(0);
+  const [resumoMesFim, setResumoMesFim] = useState(0);
+
+  // Faixa de meses (ex.: janeiro a junho) só se aplica quando o filtro de mês único
+  // acima estiver em "Todos os meses" — evita as duas opções brigarem entre si.
+  const filtroResumoRange = useMemo(() => {
+    if (filtroResumo.mes || (!resumoMesInicio && !resumoMesFim)) return filtroResumo.filtrados;
+    const inicio = resumoMesInicio || 1;
+    const fim = resumoMesFim || 12;
+    return filtroResumo.filtrados.filter((p) => !!p.mes && p.mes >= inicio && p.mes <= fim);
+  }, [filtroResumo.filtrados, filtroResumo.mes, resumoMesInicio, resumoMesFim]);
+
+  const porArea = useMemo(() => {
+    const mapa = new Map<string, { programados: number; total: number; valor: number; comValorReal: number }>();
+    for (const p of filtroResumoRange) {
+      const chave = p.setor ?? "Não classificado";
+      const atual = mapa.get(chave) ?? { programados: 0, total: 0, valor: 0, comValorReal: 0 };
+      atual.total++;
+      if (p.gozoInicio) {
+        atual.programados++;
+        atual.valor += valorEfetivo(p);
+        if (p.valorReal !== null) atual.comValorReal++;
+      }
+      mapa.set(chave, atual);
+    }
+    return [...mapa.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [filtroResumoRange]);
+
+  const porMesQuinzena = useMemo(() => {
+    const mapa = new Map<
+      string,
+      {
+        mes: number;
+        ano: number;
+        quinzena: number;
+        calendario: string;
+        rotulo: string;
+        qtd: number;
+        valor: number;
+        comValorReal: number;
+        // Início do gozo e data de pagamento variam por colaborador quando há abono no início do
+        // período (empurra a data real de início). Contamos os PARES (início, pagamento) juntos — e
+        // não cada um separado — pra não acabar mostrando um início de uma turma com o pagamento de
+        // outra.
+        pares: Map<string, { count: number; gozoInicio: string; dataPagamento: string }>;
+      }
+    >();
+    for (const p of filtroResumoRange) {
+      if (!p.mes || !p.ano || !p.quinzena || !p.gozoInicio || !p.dataPagamento) continue;
+      // Calendário mensal (ex.: VPAR, LOGTRANS): grupo próprio da empresa, com a data dela.
+      const calendario = p.calendarioMensal ? p.calendario : "padrao";
+      const chave = `${p.ano}-${p.mes}-${calendario}-${p.quinzena}`;
+      const rotulo = p.calendarioMensal
+        ? `Data do mês — ${calendarios.find((c) => c.id === p.calendario)?.nome ?? p.empresa}`
+        : `${p.quinzena}ª quinzena`;
+      const atual =
+        mapa.get(chave) ??
+        { mes: p.mes, ano: p.ano, quinzena: p.quinzena, calendario, rotulo, qtd: 0, valor: 0, comValorReal: 0, pares: new Map() };
+      atual.qtd++;
+      atual.valor += valorEfetivo(p);
+      if (p.valorReal !== null) atual.comValorReal++;
+      const chavePar = `${p.gozoInicio}|${p.dataPagamento}`;
+      const par = atual.pares.get(chavePar) ?? { count: 0, gozoInicio: p.gozoInicio, dataPagamento: p.dataPagamento };
+      par.count++;
+      atual.pares.set(chavePar, par);
+      mapa.set(chave, atual);
+    }
+    return [...mapa.values()]
+      .sort((a, b) => a.ano - b.ano || a.mes - b.mes || a.quinzena - b.quinzena || a.rotulo.localeCompare(b.rotulo))
+      .map((v) => {
+        const maisFrequente = [...v.pares.values()].sort((a, b) => b.count - a.count)[0];
+        let gozoInicio: Date;
+        let dataPagamento: Date;
+        if (maisFrequente) {
+          gozoInicio = new Date(maisFrequente.gozoInicio);
+          dataPagamento = new Date(maisFrequente.dataPagamento);
+        } else {
+          const custom = quinzenas.find(
+            (q) => q.calendario === v.calendario && q.ano === v.ano && q.mes === v.mes && q.quinzena === v.quinzena
+          );
+          gozoInicio = custom
+            ? new Date(custom.dataInicio)
+            : new Date(Date.UTC(v.ano, v.mes - 1, v.quinzena === 2 ? 16 : 1));
+          dataPagamento = dataPagamentoFerias(gozoInicio);
+        }
+        const { pares: _pares, ...resto } = v;
+        return { ...resto, gozoInicio, dataPagamento };
+      });
+  }, [filtroResumoRange, quinzenas, calendarios]);
+
+  const porMes = useMemo(() => {
+    const mapa = new Map<string, { qtd: number; valor: number; comValorReal: number }>();
+    for (const v of porMesQuinzena) {
+      const chave = `${MESES[v.mes - 1]}/${v.ano}`;
+      const atual = mapa.get(chave) ?? { qtd: 0, valor: 0, comValorReal: 0 };
+      atual.qtd += v.qtd;
+      atual.valor += v.valor;
+      atual.comValorReal += v.comValorReal;
+      mapa.set(chave, atual);
+    }
+    return [...mapa.entries()];
+  }, [porMesQuinzena]);
+
+  const valorPorQuinzena = useMemo(() => {
+    let quinzena1 = 0;
+    let quinzena2 = 0;
+    for (const p of filtroResumoRange) {
+      if (!p.gozoInicio || !p.quinzena) continue;
+      const valor = valorEfetivo(p);
+      if (p.quinzena === 1) quinzena1 += valor;
+      else quinzena2 += valor;
+    }
+    return { quinzena1, quinzena2, total: quinzena1 + quinzena2 };
+  }, [filtroResumoRange]);
+
+  function exportarEnvioGestores() {
+    baixarCsv(
+      "envio_gestores_ferias.csv",
+      ["Matrícula", "Nome", "Departamento", "Limite", "Mês", "1ª Quinz.", "2ª Quinz.", "Gozo Inicial", "Gozo Final"],
+      periodosFiltrados.map((p) => [
+        p.matricula,
+        p.nome,
+        p.departamento ?? "",
+        formatarData(p.dataLimite),
+        p.mes ? `${MESES[p.mes - 1]}/${p.ano}` : "",
+        !p.calendarioMensal && p.quinzena === 1 ? "X" : "",
+        !p.calendarioMensal && p.quinzena === 2 ? "X" : "",
+        formatarData(p.gozoInicio),
+        formatarData(p.gozoFim),
+      ])
+    );
+  }
+
+  function exportarResumoCsv() {
+    baixarCsv(
+      "resumo_ferias_por_mes_quinzena.csv",
+      ["Mês", "Ano", "Quinzena", "Quantidade", "Valor", "Com Valor Real", "Início do Gozo", "Data de Pagamento"],
+      porMesQuinzena.map((v) => [
+        MESES[v.mes - 1],
+        String(v.ano),
+        v.rotulo,
+        String(v.qtd),
+        v.valor.toFixed(2),
+        `${v.comValorReal} de ${v.qtd}`,
+        v.gozoInicio.toLocaleDateString("pt-BR", { timeZone: "UTC" }),
+        v.dataPagamento.toLocaleDateString("pt-BR", { timeZone: "UTC" }),
+      ])
+    );
+  }
+
+  return (
+    <Tabs defaultValue="programacao" className="flex flex-col gap-4">
+      <style>{`@media print { @page { size: landscape; margin: 6mm; } thead { display: table-header-group; } tr { break-inside: avoid; } }`}</style>
+      <TabsList className="print:hidden">
+        <TabsTab value="programacao">Programação</TabsTab>
+        {podeOperar && <TabsTab value="avisos">Avisos WhatsApp</TabsTab>}
+        {podeOperar && <TabsTab value="importar">Importar TXT</TabsTab>}
+        <TabsTab value="calendario">Calendário de Quinzenas</TabsTab>
+        <TabsTab value="resumo">Resumo</TabsTab>
+        <TabsTab value="mural">Painel / Mural</TabsTab>
+        <TabsIndicator />
+      </TabsList>
+
+      <TabsPanel value="programacao" className="flex flex-col gap-3">
+        {periodos.length === 0 ? (
+          <p className="font-mono text-[11px] text-text-3">
+            Nenhum período de férias importado ainda. Vá para a aba &quot;Importar TXT&quot; e envie o relatório do
+            ERP primeiro.
+          </p>
+        ) : (
+          <>
+            {retornadosSemProgramar.length > 0 && (
+              <div className="flex items-start gap-2.5 rounded-sm border border-danger/40 bg-danger/10 px-3.5 py-2.5">
+                <AlertTriangle className="mt-0.5 size-4 shrink-0 text-danger" />
+                <div className="flex flex-col gap-1">
+                  <p className="font-mono text-[11px] font-bold tracking-[.04em] text-danger uppercase">
+                    {retornadosSemProgramar.length} colaborador(es) voltou(ram) de afastamento e ainda não tem(têm)
+                    férias programada(s)
+                  </p>
+                  <p className="flex flex-wrap gap-x-1.5 font-mono text-[10px] text-text-2">
+                    {retornadosSemProgramar.map((p, i) => (
+                      <span key={p.id}>
+                        {p.nome}
+                        {i < retornadosSemProgramar.length - 1 ? " ·" : ""}
+                      </span>
+                    ))}
+                  </p>
+                </div>
+              </div>
+            )}
+            {naoProgramados.length > 0 && (() => {
+              const urgente = alertaVencendo.length > 0;
+              const corBox = urgente
+                ? "border-danger/40 bg-danger/10"
+                : "border-warning/40 bg-warning/10";
+              const corIcone = urgente ? "text-danger" : "text-warning";
+              const corTitulo = urgente ? "text-danger" : "text-warning";
+              const ordenados = [...naoProgramados].sort((a, b) => b.meses - a.meses);
+              return (
+                <div className={`flex items-start gap-2.5 rounded-sm border px-3.5 py-2.5 ${corBox}`}>
+                  <AlertTriangle className={`mt-0.5 size-4 shrink-0 ${corIcone}`} />
+                  <div className="flex flex-col gap-1">
+                    <p className={`font-mono text-[11px] font-bold tracking-[.04em] uppercase ${corTitulo}`}>
+                      {naoProgramados.length} colaborador(es) sem programação
+                      {urgente && ` — ${alertaVencendo.length} com 21+ meses vencidos`}
+                    </p>
+                    <p className="font-mono text-[10px] text-text-2">
+                      {[...new Set(naoProgramados.map((p) => p.empresa))]
+                        .map((emp) => `${emp}: ${naoProgramados.filter((p) => p.empresa === emp).length}`)
+                        .join(" · ")}
+                    </p>
+                    <p className="flex flex-wrap gap-x-1.5 font-mono text-[10px] text-text-2">
+                      {ordenados.slice(0, 10).map((p, i) => (
+                        <span key={p.id} className={p.meses >= 21 ? "font-bold text-danger" : undefined}>
+                          {p.nome}
+                          {p.meses >= 21 ? ` (${p.meses}m)` : ""}
+                          {i < Math.min(ordenados.length, 10) - 1 ? " ·" : ""}
+                        </span>
+                      ))}
+                      {ordenados.length > 10 && <span>· +{ordenados.length - 10}</span>}
+                    </p>
+                  </div>
+                </div>
+              );
+            })()}
+            <div className="flex flex-wrap items-center justify-between gap-2.5">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <input
+                  type="text"
+                  placeholder="Buscar por matrícula ou nome..."
+                  value={busca}
+                  onChange={(e) => setBusca(e.target.value)}
+                  className="h-8 w-64 rounded-sm border border-border-hi bg-secondary px-2.5 font-mono text-[11px] text-foreground outline-none placeholder:text-text-3 focus-visible:border-primary"
+                />
+                <select
+                  className="h-8 rounded-sm border border-border-hi bg-secondary px-2 font-mono text-[11px] text-foreground outline-none focus-visible:border-primary"
+                  value={filtroStatus}
+                  onChange={(e) => setFiltroStatus(e.target.value as "todos" | "programados" | "nao-programados")}
+                >
+                  <option value="todos">Todos os status</option>
+                  <option value="nao-programados">Não programados</option>
+                  <option value="programados">Programados</option>
+                </select>
+                <FiltroBar
+                  empresas={empresas}
+                  areas={areas}
+                  departamentos={departamentos}
+                  filtro={filtroProgramacao}
+                  mostrarDepartamento
+                  mostrarAno
+                />
+              </div>
+              <div className="flex gap-2">
+                <a
+                  href={`/admin/ferias/programacao-pdf?${new URLSearchParams({
+                    ...(busca && { busca }),
+                    ...(filtroProgramacao.empresa && { empresa: filtroProgramacao.empresa }),
+                    ...(filtroProgramacao.area && { area: filtroProgramacao.area }),
+                    ...(filtroProgramacao.departamento && { departamento: filtroProgramacao.departamento }),
+                    ...(filtroProgramacao.mes && { mes: String(filtroProgramacao.mes) }),
+                    ...(filtroProgramacao.ano && { ano: String(filtroProgramacao.ano) }),
+                    ...(filtroStatus !== "todos" && { status: filtroStatus }),
+                  }).toString()}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <Button size="sm" variant="secondary">
+                    <FileDown className="size-3.5" />
+                    Exportar PDF
+                  </Button>
+                </a>
+                <Button size="sm" variant="secondary" onClick={exportarEnvioGestores}>
+                  <Download className="size-3.5" />
+                  Exportar CSV p/ gestores
+                </Button>
+              </div>
+            </div>
+            <p className="font-mono text-[10px] text-text-3">
+              {periodosFiltrados.length} de {periodos.length} período(s) · {programados.length} programado(s) ·{" "}
+              {naoProgramados.length} pendente(s)
+              {podeOperar && (
+                <>
+                  {" "}— clique em <span className="font-bold text-primary">Programar/Editar</span> na linha do
+                  colaborador pra lançar ou alterar mês, quinzena e abono a qualquer momento
+                </>
+              )}
+            </p>
+            {programadosPorAreaQuinzena.length > 0 && (
+              <p className="flex flex-wrap items-center gap-x-1.5 font-mono text-[10px] text-text-3">
+                <span className="font-bold text-text-2 uppercase tracking-[.04em]">Programados por área:</span>
+                {programadosPorAreaQuinzena.map(([nome, v], i) => (
+                  <span key={nome}>
+                    {nome} (1ª: {v.q1} · 2ª: {v.q2} · tot: {v.q1 + v.q2})
+                    {i < programadosPorAreaQuinzena.length - 1 ? " ·" : ""}
+                  </span>
+                ))}
+              </p>
+            )}
+            <Table containerClassName="max-h-[70vh] overflow-y-auto">
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="px-2">Matr.</TableHead>
+                  <TableHead className="px-2">Nome</TableHead>
+                  <TableHead className="px-2">Depto</TableHead>
+                  <TableHead className="px-2">Falt.</TableHead>
+                  <TableHead className="px-2">Dias</TableHead>
+                  <TableHead className="px-2" title="Meses vencido">Mses venc.</TableHead>
+                  <TableHead className="px-2">Limite</TableHead>
+                  <TableHead className="px-2" title="Mês programado">Mês prog.</TableHead>
+                  <TableHead className="px-2">Gozo Ini.</TableHead>
+                  <TableHead className="px-2">Gozo Fim</TableHead>
+                  <TableHead className="px-2" title="Status: P = Programado, N = Não programado, C = Concluído">
+                    St.
+                  </TableHead>
+                  <TableHead></TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {periodosFiltrados.map((p) => (
+                  <TableRow key={p.id}>
+                    <TableCell className="px-2 whitespace-nowrap">{p.matricula}</TableCell>
+                    <TableCell className="px-2 font-medium text-foreground whitespace-nowrap">
+                      {p.travado && (
+                        <span title="Programação travada — não deve ser alterada">
+                          <AlertTriangle className="mr-1 inline size-3 text-danger" />
+                        </span>
+                      )}
+                      {p.nome}
+                      {p.afastado && (
+                        <span
+                          title={p.motivoAfastamento ?? "Afastada"}
+                          className="ml-1.5 inline-flex items-center rounded-[3px] border border-warning/30 bg-warning/10 px-1 py-px font-mono text-[9px] font-bold text-warning uppercase"
+                        >
+                          Afastada
+                        </span>
+                      )}
+                    </TableCell>
+                    <TableCell className="px-2 whitespace-nowrap">{p.departamento ?? "—"}</TableCell>
+                    <TableCell className="px-2 text-center">{p.faltas}</TableCell>
+                    <TableCell className="px-2 text-center font-medium text-foreground">{p.diasDireito}</TableCell>
+                    <TableCell
+                      className={`px-2 text-center ${p.meses >= 21 ? "font-bold text-danger" : ""}`}
+                    >
+                      {p.meses}
+                      {p.meses >= 21 && <AlertTriangle className="ml-1 inline size-3 text-danger" />}
+                    </TableCell>
+                    <TableCell className="px-2 whitespace-nowrap">{formatarData(p.dataLimite)}</TableCell>
+                    <TableCell className="px-2 whitespace-nowrap">
+                      {rotuloProgramacao(p)}
+                    </TableCell>
+                    <TableCell className="px-2 whitespace-nowrap">{formatarData(p.gozoInicio)}</TableCell>
+                    <TableCell className="px-2 whitespace-nowrap">{formatarData(p.gozoFim)}</TableCell>
+                    <TableCell className="px-2">{statusBadge(p.gozoInicio ? "programado" : "pendente")}</TableCell>
+                    <TableCell className="px-2">
+                      <div className="flex items-center gap-1.5">
+                        {podeOperar && (
+                          <ProgramarDialog periodo={p} quinzenas={quinzenas} periodos={periodos} onSaved={atualizarPeriodo} />
+                        )}
+                        {p.gozoInicio && (
+                          <a
+                            href={`/admin/ferias/aviso-pdf?ids=${p.id}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title="Imprimir Aviso de Férias"
+                            aria-label={`Imprimir Aviso de Férias de ${p.nome}`}
+                            className="inline-flex size-7 items-center justify-center rounded-sm border border-border-hi bg-secondary text-secondary-foreground hover:opacity-85"
+                          >
+                            <Printer className="size-3.5" />
+                          </a>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </>
+        )}
+      </TabsPanel>
+
+      {podeOperar && (
+        <TabsPanel value="avisos" className="flex flex-col gap-3">
+          <AvisosWhatsapp periodos={periodos} onAtualizado={atualizarPeriodo} />
+        </TabsPanel>
+      )}
+
+      {podeOperar && (
+        <TabsPanel value="importar">
+          <Importador />
+        </TabsPanel>
+      )}
+
+      <TabsPanel value="calendario" className="flex flex-col gap-3">
+        <p className="font-mono text-[11px] text-text-3">
+          Cada empresa segue o seu calendário: quinzenas (referência fixa: 1ª do dia 1 ao 15, 2ª do dia 16 ao
+          fim do mês) ou, nas empresas com uma data por mês, a data cadastrada para cada mês.
+        </p>
+        <CalendarioQuinzenas quinzenas={quinzenas} calendarios={calendarios} onSaved={atualizarQuinzena} />
+      </TabsPanel>
+
+      <TabsPanel value="resumo" className="flex flex-col gap-6">
+        <div className="flex flex-wrap items-center gap-2 print:hidden">
+          <FiltroBar empresas={empresas} areas={areas} filtro={filtroResumo} mostrarAno />
+          <span className="font-mono text-[11px] text-text-3">·</span>
+          <span className="font-mono text-[11px] text-text-3">Período:</span>
+          <select
+            className="h-8 rounded-sm border border-border-hi bg-secondary px-2 font-mono text-[11px] text-foreground outline-none focus-visible:border-primary disabled:opacity-40"
+            value={resumoMesInicio}
+            disabled={!!filtroResumo.mes}
+            onChange={(e) => setResumoMesInicio(Number(e.target.value))}
+          >
+            <option value={0}>De (início)</option>
+            {MESES.map((m, i) => (
+              <option key={m} value={i + 1}>{m}</option>
+            ))}
+          </select>
+          <select
+            className="h-8 rounded-sm border border-border-hi bg-secondary px-2 font-mono text-[11px] text-foreground outline-none focus-visible:border-primary disabled:opacity-40"
+            value={resumoMesFim}
+            disabled={!!filtroResumo.mes}
+            onChange={(e) => setResumoMesFim(Number(e.target.value))}
+          >
+            <option value={0}>Até (fim)</option>
+            {MESES.map((m, i) => (
+              <option key={m} value={i + 1}>{m}</option>
+            ))}
+          </select>
+          {(resumoMesInicio > 0 || resumoMesFim > 0) && !filtroResumo.mes && (
+            <Button
+              size="xs"
+              variant="secondary"
+              onClick={() => {
+                setResumoMesInicio(0);
+                setResumoMesFim(0);
+              }}
+            >
+              Limpar período
+            </Button>
+          )}
+        </div>
+        {filtroResumo.mes > 0 && (resumoMesInicio > 0 || resumoMesFim > 0) && (
+          <p className="-mt-4 font-mono text-[10px] text-warning">
+            O filtro de período (De/Até) fica desativado enquanto um mês específico estiver selecionado acima.
+          </p>
+        )}
+
+        <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3">
+          <div className="flex flex-col gap-1 rounded-sm border border-border bg-secondary px-4 py-3">
+            <span className="font-mono text-[10px] tracking-[.06em] text-text-3 uppercase">1ª Quinzena</span>
+            <span className="font-mono text-[18px] leading-none font-bold text-foreground">
+              {formatarMoeda(valorPorQuinzena.quinzena1)}
+            </span>
+          </div>
+          <div className="flex flex-col gap-1 rounded-sm border border-border bg-secondary px-4 py-3">
+            <span className="font-mono text-[10px] tracking-[.06em] text-text-3 uppercase">2ª Quinzena</span>
+            <span className="font-mono text-[18px] leading-none font-bold text-foreground">
+              {formatarMoeda(valorPorQuinzena.quinzena2)}
+            </span>
+          </div>
+          <div className="flex flex-col gap-1 rounded-sm border border-primary/30 bg-accent-glow px-4 py-3">
+            <span className="font-mono text-[10px] tracking-[.06em] text-primary uppercase">Total programado</span>
+            <span className="font-mono text-[18px] leading-none font-bold text-primary">
+              {formatarMoeda(valorPorQuinzena.total)}
+            </span>
+          </div>
+        </div>
+
+        <div>
+          <h3 className="mb-2 font-mono text-[11px] font-bold tracking-[.06em] text-text-2 uppercase">
+            Programados por Área
+          </h3>
+          {porArea.length === 0 ? (
+            <p className="font-mono text-[11px] text-text-3">Nenhum período no filtro atual.</p>
+          ) : (
+            <ResponsiveContainer width="100%" height={Math.max(120, porArea.length * 40)}>
+              <BarChart
+                data={porArea.map(([nome, v]) => ({ nome, ...v }))}
+                layout="vertical"
+                margin={{ left: 8, right: 24 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" stroke="#2a3038" horizontal={false} />
+                <XAxis type="number" allowDecimals={false} tick={{ fontSize: 10, fill: "#7590a8" }} stroke="#2a3038" />
+                <YAxis type="category" dataKey="nome" width={140} tick={{ fontSize: 10, fill: "#8fa0b0" }} stroke="#2a3038" />
+                <Tooltip
+                  contentStyle={TOOLTIP_STYLE}
+                  formatter={(value, name, item) => {
+                    if (name !== "Programados") return [value, name];
+                    const v = item.payload as { valor: number; comValorReal: number; programados: number };
+                    const detalhe =
+                      v.programados > 0 ? ` (${v.comValorReal} de ${v.programados} com valor real)` : "";
+                    return [`${formatarMoeda(v.valor)}${detalhe}`, "Valor"];
+                  }}
+                />
+                <Bar dataKey="programados" name="Programados" fill={COR_PROGRAMADOS} radius={[0, 4, 4, 0]} maxBarSize={22} />
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+
+        <div>
+          <h3 className="mb-2 font-mono text-[11px] font-bold tracking-[.06em] text-text-2 uppercase">
+            Valor por Mês
+          </h3>
+          {porMes.length === 0 ? (
+            <p className="font-mono text-[11px] text-text-3">Nenhum período programado no filtro atual.</p>
+          ) : (
+            <ResponsiveContainer width="100%" height={260}>
+              <BarChart data={porMes.map(([nome, v]) => ({ nome, ...v }))} margin={{ left: 8, right: 24, top: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#2a3038" vertical={false} />
+                <XAxis dataKey="nome" tick={{ fontSize: 10, fill: "#8fa0b0" }} stroke="#2a3038" />
+                <YAxis
+                  tick={{ fontSize: 10, fill: "#7590a8" }}
+                  stroke="#2a3038"
+                  width={56}
+                  tickFormatter={(v) => formatarMoeda(Number(v))}
+                />
+                <Tooltip
+                  contentStyle={TOOLTIP_STYLE}
+                  formatter={(value, name, item) => {
+                    const v = item.payload as { valor: number; comValorReal: number; qtd: number };
+                    const detalhe = v.qtd > 0 ? ` (${v.comValorReal} de ${v.qtd} com valor real)` : "";
+                    return [`${formatarMoeda(Number(value))}${detalhe}`, "Valor"];
+                  }}
+                />
+                <Bar dataKey="valor" name="Valor" fill={COR_VALOR} maxBarSize={32} radius={[3, 3, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+
+        <div>
+          <h3 className="mb-2 font-mono text-[11px] font-bold tracking-[.06em] text-text-2 uppercase">Por Área</h3>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Área</TableHead>
+                <TableHead>Programados</TableHead>
+                <TableHead>Total</TableHead>
+                <TableHead>Valor</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {porArea.map(([nome, v]) => (
+                <TableRow key={nome}>
+                  <TableCell className="font-medium text-foreground">{nome}</TableCell>
+                  <TableCell>{v.programados}</TableCell>
+                  <TableCell>{v.total}</TableCell>
+                  <TableCell>
+                    {formatarMoeda(v.valor)}
+                    {v.programados > 0 && (
+                      <span className="ml-1.5 font-mono text-[10px] text-text-3">
+                        ({v.comValorReal} de {v.programados} com valor real)
+                      </span>
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+        <div>
+          <div className="mb-2 flex items-center justify-between">
+            <h3 className="font-mono text-[11px] font-bold tracking-[.06em] text-text-2 uppercase">
+              Por Mês e Quinzena
+            </h3>
+            <div className="flex gap-2">
+              <Button size="xs" variant="secondary" onClick={exportarResumoCsv}>
+                <Download className="size-3" />
+                CSV
+              </Button>
+              <a
+                href={`/admin/ferias/resumo-pdf?${new URLSearchParams({
+                  ...(filtroResumo.empresa && { empresa: filtroResumo.empresa }),
+                  ...(filtroResumo.area && { area: filtroResumo.area }),
+                  ...(filtroResumo.mes && { mes: String(filtroResumo.mes) }),
+                  ...(filtroResumo.ano && { ano: String(filtroResumo.ano) }),
+                  ...(!filtroResumo.mes && resumoMesInicio && { mesInicio: String(resumoMesInicio) }),
+                  ...(!filtroResumo.mes && resumoMesFim && { mesFim: String(resumoMesFim) }),
+                }).toString()}`}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <Button size="xs" variant="secondary">
+                  <FileDown className="size-3" />
+                  PDF
+                </Button>
+              </a>
+            </div>
+          </div>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Mês</TableHead>
+                <TableHead>Quinzena</TableHead>
+                <TableHead>Qtde.</TableHead>
+                <TableHead>Valor</TableHead>
+                <TableHead>Início do gozo</TableHead>
+                <TableHead>Data de pagamento</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {porMesQuinzena.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={6} className="text-center text-text-3">
+                    Nenhum período programado no filtro atual.
+                  </TableCell>
+                </TableRow>
+              ) : (
+                porMesQuinzena.map((v) => (
+                  <TableRow key={`${v.ano}-${v.mes}-${v.calendario}-${v.quinzena}`}>
+                    <TableCell className="font-medium text-foreground">
+                      {MESES[v.mes - 1]}/{v.ano}
+                    </TableCell>
+                    <TableCell>{v.rotulo}</TableCell>
+                    <TableCell>{v.qtd}</TableCell>
+                    <TableCell>
+                      {formatarMoeda(v.valor)}
+                      <span className="ml-1.5 font-mono text-[10px] text-text-3">
+                        ({v.comValorReal} de {v.qtd} com valor real)
+                      </span>
+                    </TableCell>
+                    <TableCell>{v.gozoInicio.toLocaleDateString("pt-BR", { timeZone: "UTC" })}</TableCell>
+                    <TableCell className="font-bold text-primary">
+                      {v.dataPagamento.toLocaleDateString("pt-BR", { timeZone: "UTC" })}
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      </TabsPanel>
+
+      <TabsPanel value="mural" className="flex flex-col gap-3">
+        <div className="flex items-center justify-between print:hidden">
+          <FiltroBar empresas={empresas} areas={areas} filtro={filtroMural} mostrarAno mostrarQuinzena />
+          <Button size="sm" variant="secondary" onClick={() => window.print()}>
+            <Printer className="size-3.5" />
+            Imprimir
+          </Button>
+        </div>
+        <p className="font-mono text-[11px] text-text-3 print:hidden">
+          lista para impressão — apenas colaboradores já programados. Filtre por mês pra imprimir o mural de um
+          período específico.
+        </p>
+        <div className="flex flex-col items-center gap-0.5 print:gap-0">
+          <h2 className="text-center font-mono text-base font-bold tracking-[.08em] uppercase print:text-lg">
+            Programação de Férias — {empresaMural}
+          </h2>
+          <p className="text-center font-mono text-[11px] font-bold tracking-[.06em] text-text-2 uppercase print:text-xs">
+            Mês de referência: {filtroMural.mes ? MESES[filtroMural.mes - 1] : "todos os períodos programados"}
+            {filtroMural.ano > 0 && `/${filtroMural.ano}`}
+            {filtroMural.area && ` · ${filtroMural.area}`}
+            {filtroMural.quinzena > 0 && ` · ${filtroMural.quinzena}ª quinzena`}
+          </p>
+        </div>
+        <Table
+          className={`${muralTamanho.tabela} print:table-fixed print:[border-collapse:collapse]`}
+          containerClassName="print:overflow-visible print:border-0"
+        >
+          <colgroup>
+            <col className="print:w-[11%]" />
+            <col className="print:w-[24%]" />
+            <col className="print:w-[17%]" />
+            <col className="print:w-[16%]" />
+            <col className="print:w-[16%]" />
+            <col className="print:w-[16%]" />
+          </colgroup>
+          <TableHeader>
+            <TableRow>
+              {(() => {
+                const headCls = `print:border print:border-neutral-500 ${muralTamanho.linhaPy} ${muralTamanho.cabecalho} print:font-bold print:text-black print:normal-case`;
+                return (
+                  <>
+                    <TableHead className={headCls}>
+                      <span className="print:hidden">Matrícula</span>
+                      <span className="hidden print:inline">Matr</span>
+                    </TableHead>
+                    <TableHead className={headCls}>Nome</TableHead>
+                    <TableHead className={headCls}>
+                      <span className="print:hidden">Departamento</span>
+                      <span className="hidden print:inline">Depart</span>
+                    </TableHead>
+                    <TableHead className={headCls}>Mês</TableHead>
+                    <TableHead className={headCls}>
+                      <span className="print:hidden">Gozo Inicial</span>
+                      <span className="hidden print:inline">Início</span>
+                    </TableHead>
+                    <TableHead className={headCls}>
+                      <span className="print:hidden">Gozo Final</span>
+                      <span className="hidden print:inline">Final</span>
+                    </TableHead>
+                  </>
+                );
+              })()}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {muralOrdenado.map((p) => {
+              // A célula tem um tamanho de fonte próprio (herdado do componente de tabela) que sempre
+              // vence o do elemento pai — por isso o tamanho precisa ser aplicado aqui, não só no <table>.
+              const celCls = `print:border print:border-neutral-400 ${muralTamanho.linhaPy} ${muralTamanho.tabela} print:font-bold print:text-black`;
+              const celClsQuebra = `${celCls} print:whitespace-normal print:break-words print:align-top`;
+              return (
+                <TableRow key={p.id}>
+                  <TableCell className={celCls}>{p.matricula}</TableCell>
+                  <TableCell className={`font-medium text-foreground ${celClsQuebra}`}>
+                    <span className="print:hidden">{p.nome}</span>
+                    <span className="hidden print:inline">{abreviarNome(p.nome)}</span>
+                  </TableCell>
+                  <TableCell className={celClsQuebra}>{p.departamento ?? "—"}</TableCell>
+                  <TableCell className={celCls}>
+                    {rotuloProgramacao(p)}
+                  </TableCell>
+                  <TableCell className={celCls}>{formatarData(p.gozoInicio)}</TableCell>
+                  <TableCell className={celCls}>{formatarData(p.gozoFim)}</TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </TabsPanel>
+    </Tabs>
+  );
+}
