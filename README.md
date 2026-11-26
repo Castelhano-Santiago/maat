@@ -5,7 +5,7 @@ Sistema interno de rotinas de departamento pessoal: recebe arquivos do ERP, proc
 ## Stack
 
 - Next.js (App Router) + TypeScript + Tailwind + shadcn/ui
-- Prisma + SQLite (`better-sqlite3`, arquivo local — sem servidor de banco)
+- Prisma + SQLite (`better-sqlite3`, arquivo local — sem servidor de banco)f
 - Better-Auth (e-mail/senha)
 
 ## Desenvolvimento
