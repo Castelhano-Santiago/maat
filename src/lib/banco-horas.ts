@@ -1,7 +1,7 @@
-// Motor de cálculo do Banco de Horas — ver BANCO_DE_HORAS_PLANO.md (regras 1-8).
+// Motor de cálculo do Banco de Horas.
 //
-// Fórmula validada por engenharia reversa contra "Saldo BH.csv" (histórico real jan-jul/2026 da
-// Pantanal, conferido pelo usuário direto na fonte original) — bate 100% (898/898 linhas):
+// Fórmula validada por engenharia reversa contra o histórico real jan-jul/2026 da Pantanal
+// (conferido pelo usuário direto na fonte original) — bate 100% (898/898 linhas):
 //
 //   creditoLiquido = creditoBruto / 2   (metade exata, sem arredondar pra cima)
 //
