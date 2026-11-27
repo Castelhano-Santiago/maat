@@ -413,10 +413,12 @@ export async function registrarAvisoWhatsapp(
   return { error: null, avisoWhatsappEm: agora.toISOString(), avisoWhatsappPor: user.name };
 }
 
+// "consultar" basta aqui — marcar que o colaborador assinou o aviso impresso é uma confirmação
+// simples, sem editar a programação, então não exige acesso completo (operar) ao módulo.
 export async function registrarAvisoAssinado(
   feriasId: string
 ): Promise<{ error: string | null; avisoAssinadoEm?: string; avisoAssinadoPor?: string }> {
-  const user = await requirePermissao("ferias", "operar");
+  const user = await requirePermissao("ferias", "consultar");
   if (!(await podeFerias(user, feriasId))) return { error: MSG_EMPRESA_NAO_LIBERADA };
   const agora = new Date();
   await prisma.ferias.update({
@@ -428,7 +430,7 @@ export async function registrarAvisoAssinado(
 }
 
 export async function desfazerAvisoAssinado(feriasId: string): Promise<{ error: string | null }> {
-  const user = await requirePermissao("ferias", "operar");
+  const user = await requirePermissao("ferias", "consultar");
   if (!(await podeFerias(user, feriasId))) return { error: MSG_EMPRESA_NAO_LIBERADA };
   await prisma.ferias.update({ where: { id: feriasId }, data: { avisoAssinadoEm: null, avisoAssinadoPor: null } });
   await logAction(user.id, "ferias.aviso_assinado_desfeito", feriasId);

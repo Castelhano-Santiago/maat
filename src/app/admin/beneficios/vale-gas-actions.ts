@@ -276,8 +276,8 @@ export async function processarApuracaoValeGas(
         elegivel,
         motivoPerda,
         pecunia: t.valeGasPecunia,
-        cidade: null,
-        valor: null,
+        cidade: regras.cidades.length > 0 ? t.cidade : null,
+        valor: t.cidade ? (valorPorCidade.get(t.cidade) ?? null) : null,
       });
     }
 

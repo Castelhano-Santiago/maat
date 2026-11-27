@@ -141,6 +141,8 @@
 }
 [data-export-theme="light"] .bg-secondary,
 [data-export-theme="light"] .bg-card,
+[data-export-theme="light"] .bg-bg-2,
+[data-export-theme="light"] .bg-bg-3,
 [data-export-theme="light"] .bg-bg-4 {
   background-color: #f3f5f7 !important;
 }

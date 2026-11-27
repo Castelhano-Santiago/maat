@@ -15,7 +15,7 @@
 //   quando ainda não importado) − 1ª parcela − INSS − IR − pensão — as mesmas regras da conferência.
 
 import type { FuncionarioFolha } from "../parsers/folha-pagamento";
-import { calcularInss, calcularIr } from "./conferencia";
+import { calcularInss, calcularIr, calendarioCompetencia, feriadosDoMes } from "./conferencia";
 import { calcularAvos, calcularMedia13, EVENTOS_MEDIA, type Contexto13 } from "./conferencia-13";
 import type { ProgramacaoFerias } from "./ferias-programacao";
 import { parametrosDoAno, type ParametrosFolha } from "./parametros";
@@ -31,6 +31,9 @@ export type AliquotasProvisao = {
 export type ValoresProvisao = {
   areas: { area: string; valor: number; colaboradores: number }[];
   liquido: number;
+  // Líquido das rescisões (termo de rescisão, com prévia própria do DP — fica fora da provisão, só no aviso).
+  // Opcional: provisões registradas antes de 27/11/2026 não têm o campo.
+  rescisoes?: number;
   pensoes: number;
   fgts: number;
   consignado: number;
@@ -69,9 +72,14 @@ const soma = (f: FuncionarioFolha, filtro: (codigo: string, coluna: string) => b
   f.eventos.filter((e) => filtro(e.codigo, e.coluna)).reduce((a, e) => a + e.valor, 0);
 const val = (f: FuncionarioFolha, codigo: string) => soma(f, (c) => c === codigo);
 const ehAprendiz = (funcao: string) => /APRENDIZ/i.test(funcao);
+const moedaTexto = (v: number) => arred(v).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// Último dia da frequência apurada na folha prévia do ERP (o restante do mês entra no fechamento).
+const DIA_CORTE_FREQUENCIA = 25;
+// Desligado com termo de rescisão na folha: sem líquido de folha (00996) — o valor é pago à parte.
+const ehRescisao = (f: FuncionarioFolha) => /^Desligado/i.test(f.situacao) && !f.eventos.some((e) => e.codigo === "00996");
 
 function vazio(): ValoresProvisao {
-  return { areas: [], liquido: 0, pensoes: 0, fgts: 0, consignado: 0, baseInssEmpresa: 0, inssEmpresa: 0, cprb: 0, inssFuncionarios: 0, irFuncionarios: 0, colaboradores: 0 };
+  return { areas: [], liquido: 0, rescisoes: 0, pensoes: 0, fgts: 0, consignado: 0, baseInssEmpresa: 0, inssEmpresa: 0, cprb: 0, inssFuncionarios: 0, irFuncionarios: 0, colaboradores: 0 };
 }
 
 function fecharAreas(porArea: Map<string, { valor: number; colaboradores: number }>) {
@@ -267,9 +275,11 @@ export function provisionarMensal(e: EntradaMensal): ValoresProvisao & { avisos:
 
 // Folha mensal a partir da folha prévia do ERP (calculada antes do fechamento da frequência, por
 // volta do dia 27): quem entra, salário, férias, afastamentos, pensões, consignado e descontos vêm da
-// própria prévia; as variáveis (HE, noturno, DSR, comissão...) ainda estão incompletas, então valem
-// o maior entre o que a prévia traz e a média das últimas 3 folhas, colaborador a colaborador. Sobre
-// o acréscimo, recalcula INSS, IR (o maior entre o da prévia e a média retida), pensão e FGTS.
+// própria prévia. A frequência (período de 1 ao fim do mês) só está apurada até o dia 25: as horas
+// da prévia (HE, noturno) são projetadas pelos dias úteis que faltam, colaborador a colaborador, e a
+// comissão que só entra no fechamento vale a média das 3 últimas folhas (DP, 27/11/2026 — a média
+// das variáveis inflava a provisão). Sobre o acréscimo, recalcula INSS, IR (o maior entre o da
+// prévia e a média retida), pensão e FGTS.
 export type EntradaPrevia = {
   competencia: string;
   previa: FuncionarioFolha[];
@@ -291,11 +301,35 @@ export function provisionarComPrevia(e: EntradaPrevia): ValoresProvisao & { avis
   const historico = new Map<string, FuncionarioFolha[]>();
   for (const folha of e.ultimas) for (const f of folha) historico.set(f.matricula, [...(historico.get(f.matricula) ?? []), f]);
 
+  // A prévia vem com a frequência apurada até o dia 25. Se todos os feriados do mês caem até lá, a HE
+  // 100% (trabalho no feriado) já está praticamente completa e não é projetada. O DSR sobre horas
+  // extras acompanha a HE projetada (DSR = HE × dias de descanso ÷ dias úteis).
+  const feriados = feriadosDoMes(e.competencia);
+  const he100Fechada = feriados.every((dia) => dia <= DIA_CORTE_FREQUENCIA);
+  const cal = calendarioCompetencia(e.competencia);
+  const fatorDsr = cal.diasUteis > 0 ? cal.diasDsr / cal.diasUteis : 0;
+  const feriadosSet = new Set(feriados);
+  let uteisApurados = 0;
+  let uteisRestantes = 0;
+  for (let dia = 1; dia <= cal.dias; dia++) {
+    if (new Date(Date.UTC(ano, mes - 1, dia)).getUTCDay() === 0 || feriadosSet.has(dia)) continue;
+    if (dia <= DIA_CORTE_FREQUENCIA) uteisApurados++;
+    else uteisRestantes++;
+  }
+  const fatorDias = uteisApurados > 0 ? uteisRestantes / uteisApurados : 0;
+  let rescisoes = 0;
+
   for (const f of e.previa) {
     const proventos = soma(f, (_, col) => col === "provento");
     const descontos = soma(f, (_, col) => col === "desconto");
     let liquido = f.eventos.some((x) => x.codigo === "00996") ? val(f, "00996") : proventos - descontos;
     if (proventos === 0 && liquido === 0) continue;
+    // Rescisão: o líquido sai do termo de rescisão, à parte; INSS, IR e FGTS seguem nas guias do mês.
+    const rescisao = ehRescisao(f);
+    if (rescisao) {
+      rescisoes++;
+      v.rescisoes = (v.rescisoes ?? 0) + liquido;
+    }
     let inss = val(f, "00451") + val(f, "00500");
     let ir = val(f, "00453") + val(f, "00481");
     let pensao = val(f, "00469") + val(f, "00470");
@@ -307,18 +341,22 @@ export function provisionarComPrevia(e: EntradaPrevia): ValoresProvisao & { avis
     // variáveis a completar).
     const meses = historico.get(f.matricula) ?? [];
     const ativo = !/^Desligado/i.test(f.situacao) && !(/^Afastado/i.test(f.situacao) && !/MATERNIDADE/i.test(f.situacao));
-    if (ativo && meses.length) {
-      const media = (filtro: (codigo: string, coluna: string) => boolean) => meses.reduce((a, m) => a + soma(m, filtro), 0) / meses.length;
-      const variavel = (c: string, col: string) => col === "provento" && !FORA_DA_MEDIA.has(c);
-      const naPrevia = soma(f, variavel);
-      const naMedia = media(variavel);
-      const extra = naMedia - naPrevia;
+    if (ativo) {
+      const media = (filtro: (codigo: string, coluna: string) => boolean) =>
+        meses.length ? meses.reduce((a, m) => a + soma(m, filtro), 0) / meses.length : 0;
+      // Horas da prévia (HE 50%, noturno e DSR do noturno; a HE 100% só se houver feriado depois do
+      // corte) projetadas pelos dias úteis que faltam, com o DSR sobre a HE projetada.
+      const doEvento = (cs: string[]) => soma(f, (c, col) => col === "provento" && cs.includes(c));
+      const he = doEvento(["00003", ...(he100Fechada ? [] : ["00363"])]);
+      const horas = he + doEvento(["00004", "00119"]);
+      let extra = horas * fatorDias + he * fatorDias * fatorDsr;
+      // Comissão (e DSR sobre comissão) só entra no fechamento: se a prévia não traz, vale a média.
+      const comissao = (c: string, col: string) => col === "provento" && (c === "00707" || c === "00708");
+      if (soma(f, comissao) === 0) extra += media(comissao);
       if (extra > 0.005) {
         completados++;
         acrescimoVariaveis += extra;
-        // Parte do acréscimo fora da base do INSS/IR (comissão adicional), na proporção da média.
-        const foraBase = naMedia > 0 ? media((c, col) => variavel(c, col) && FORA_DA_BASE.has(c)) / naMedia : 0;
-        const extraBase = extra * (1 - foraBase);
+        const extraBase = extra;
         const novaBase = baseInss + extraBase;
         const novoInss = Math.max(inss + calcularInss(novaBase, p) - calcularInss(baseInss, p), inss);
         const cadastros = e.pensoes.get(f.matricula) ?? [];
@@ -329,7 +367,13 @@ export function provisionarComPrevia(e: EntradaPrevia): ValoresProvisao & { avis
           novaPensao = r.pensao;
           novoIr = r.ir + val(f, "00481");
         } else {
-          novoIr = Math.max(ir, media((c) => c === "00453" || c === "00481"));
+          // IR do salário pela tabela, sobre a base da prévia (00096) antes e depois do acréscimo; a
+          // diferença soma ao IR descontado na prévia (o IR das férias, 00481, não muda).
+          const irSobre = (bruto: number, inssSal: number) =>
+            calcularIr(Math.max(0, Math.min(bruto - inssSal - val(f, "00800") - pensao, bruto - p.irDescontoSimplificado)), bruto, p);
+          const bruto = val(f, "00096");
+          const inssSalario = val(f, "00451");
+          novoIr = ir + Math.max(0, irSobre(bruto + extraBase, inssSalario + (novoInss - inss)) - irSobre(bruto, inssSalario));
         }
         liquido += extra - (novoInss - inss) - (novoIr - ir) - (novaPensao - pensao);
         fgts += extraBase * (ehAprendiz(f.funcao) ? p.fgtsAprendiz : p.fgts);
@@ -341,11 +385,13 @@ export function provisionarComPrevia(e: EntradaPrevia): ValoresProvisao & { avis
       }
     }
 
-    const reg = porArea.get(areaDaDivisao(f.divisao)) ?? { valor: 0, colaboradores: 0 };
-    reg.valor += liquido;
-    reg.colaboradores++;
-    porArea.set(areaDaDivisao(f.divisao), reg);
-    v.liquido += liquido;
+    if (!rescisao) {
+      const reg = porArea.get(areaDaDivisao(f.divisao)) ?? { valor: 0, colaboradores: 0 };
+      reg.valor += liquido;
+      reg.colaboradores++;
+      porArea.set(areaDaDivisao(f.divisao), reg);
+      v.liquido += liquido;
+    }
     v.pensoes += pensao;
     v.fgts += fgts;
     v.consignado += soma(f, (c, col) => col === "desconto" && ehConsignado(c));
@@ -358,8 +404,12 @@ export function provisionarComPrevia(e: EntradaPrevia): ValoresProvisao & { avis
   v.areas = fecharAreas(porArea);
   encargosEmpresa(v, e.aliquotas, e.receita, true);
   const avisos = [
-    `Base: folha prévia do ERP da competência. ${completados} colaborador(es) com variáveis completadas pela média dos 3 últimos meses (+ ${arred(acrescimoVariaveis).toLocaleString("pt-BR", { minimumFractionDigits: 2 })} em proventos).`,
+    `Base: folha prévia do ERP da competência (frequência até o dia ${DIA_CORTE_FREQUENCIA}). HE 50% e noturno projetados pelos ${uteisRestantes} dia(s) útil(eis) que faltam (÷ ${uteisApurados} apurados = +${(fatorDias * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%), com o DSR; comissão pela média dos 3 meses quando ainda não está na prévia. ${completados} colaborador(es), + ${moedaTexto(acrescimoVariaveis)} em proventos.`,
+    he100Fechada
+      ? `HE 100% como está na prévia: ${feriados.length ? `os feriados do mês (${feriados.map((d) => String(d).padStart(2, "0")).join(", ")}) já estão` : "não há feriado no mês"} no período apurado.`
+      : `HE 100% também projetada: há feriado depois do dia ${DIA_CORTE_FREQUENCIA}, fora do período apurado.`,
   ];
+  if (rescisoes) avisos.push(`${rescisoes} rescisão(ões) fora da provisão (${moedaTexto(v.rescisoes ?? 0)} líquido) — a rescisão tem prévia própria, à parte.`);
   return { ...arredondar(v), avisos, acrescimoVariaveis: arred(acrescimoVariaveis), completados };
 }
 
@@ -372,6 +422,7 @@ function arredondar(v: ValoresProvisao): ValoresProvisao {
   return {
     ...v,
     liquido: arred(v.liquido),
+    rescisoes: arred(v.rescisoes ?? 0),
     pensoes: arred(v.pensoes),
     fgts: arred(v.fgts),
     consignado: arred(v.consignado),
@@ -494,12 +545,16 @@ export function valoresDaFolha(
     const descontos = soma(f, (_, col) => col === "desconto");
     const liquido = tipo === "mensal" ? (f.eventos.some((x) => x.codigo === "00996") ? val(f, "00996") : proventos - descontos) : val(f, "00110");
     if (proventos === 0 && liquido === 0) continue;
-    const reg = porArea.get(areaDaDivisao(f.divisao)) ?? { valor: 0, colaboradores: 0 };
-    reg.valor += liquido;
-    reg.colaboradores++;
-    porArea.set(areaDaDivisao(f.divisao), reg);
-    v.liquido += liquido;
     v.colaboradores++;
+    if (tipo === "mensal" && ehRescisao(f)) {
+      v.rescisoes = (v.rescisoes ?? 0) + liquido;
+    } else {
+      const reg = porArea.get(areaDaDivisao(f.divisao)) ?? { valor: 0, colaboradores: 0 };
+      reg.valor += liquido;
+      reg.colaboradores++;
+      porArea.set(areaDaDivisao(f.divisao), reg);
+      v.liquido += liquido;
+    }
     if (tipo === "mensal") {
       v.pensoes += val(f, "00469") + val(f, "00470");
       v.fgts += val(f, "00993");

@@ -2,7 +2,7 @@
 
 import { useMemo, useState, useTransition } from "react";
 import { toast } from "sonner";
-import { Download, Printer, CalendarPlus, FileDown, AlertTriangle } from "lucide-react";
+import { Download, Printer, CalendarPlus, FileDown, AlertTriangle, Check } from "lucide-react";
 import {
   Bar,
   BarChart,
@@ -31,7 +31,14 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { salvarProgramacao, salvarQuinzena, alternarExibirMural, alternarTravamento } from "./actions";
+import {
+  salvarProgramacao,
+  salvarQuinzena,
+  alternarExibirMural,
+  alternarTravamento,
+  registrarAvisoAssinado,
+  desfazerAvisoAssinado,
+} from "./actions";
 import { Importador } from "./importador";
 import { AvisosWhatsapp } from "./avisos-whatsapp";
 import { usePodeOperar } from "@/components/permissoes-provider";
@@ -247,6 +254,68 @@ function TravadoToggle({
       />
       <span className="font-mono text-[9px] text-text-3">{periodo.travado ? "Sim" : "Não"}</span>
     </label>
+  );
+}
+
+// Botão "Ass" (assinatura) na aba Programação — qualquer um com acesso a Férias pode marcar/
+// desmarcar, mesmo quem só consulta: confirmar que o aviso foi assinado não edita a programação.
+// Normalmente já vem marcado sozinho ao imprimir o aviso ali do lado (ver <PrintAvisoButton />);
+// este botão cobre quando precisa corrigir ou foi assinado sem imprimir por aqui.
+function AssinaturaButton({
+  periodo,
+  onSaved,
+}: {
+  periodo: FeriasLinha;
+  onSaved: (p: FeriasLinha) => void;
+}) {
+  const [isPending, startTransition] = useTransition();
+
+  function marcar() {
+    startTransition(async () => {
+      const r = await registrarAvisoAssinado(periodo.id);
+      if (r.error) {
+        toast.error(r.error);
+        return;
+      }
+      onSaved({ ...periodo, avisoAssinadoEm: r.avisoAssinadoEm ?? null, avisoAssinadoPor: r.avisoAssinadoPor ?? null });
+    });
+  }
+
+  function desfazer() {
+    startTransition(async () => {
+      const r = await desfazerAvisoAssinado(periodo.id);
+      if (r.error) {
+        toast.error(r.error);
+        return;
+      }
+      onSaved({ ...periodo, avisoAssinadoEm: null, avisoAssinadoPor: null });
+    });
+  }
+
+  if (periodo.avisoAssinadoEm) {
+    return (
+      <button
+        type="button"
+        disabled={isPending}
+        onClick={desfazer}
+        title={`Assinado em ${formatarData(periodo.avisoAssinadoEm)}${periodo.avisoAssinadoPor ? ` · ${periodo.avisoAssinadoPor}` : ""} — clique para desmarcar`}
+        className="inline-flex size-7 items-center justify-center rounded-sm border border-success/30 bg-success-dim font-mono text-[10px] font-bold text-success hover:opacity-85"
+      >
+        <Check className="size-3.5" />
+      </button>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      disabled={isPending}
+      onClick={marcar}
+      title="Marcar que o colaborador assinou o aviso de férias"
+      className="inline-flex size-7 items-center justify-center rounded-sm border border-border-hi bg-secondary font-mono text-[10px] font-bold text-secondary-foreground hover:opacity-85"
+    >
+      Ass
+    </button>
   );
 }
 
@@ -1488,13 +1557,27 @@ export function FeriasTable({
                             href={`/admin/ferias/aviso-pdf?ids=${p.id}`}
                             target="_blank"
                             rel="noopener noreferrer"
-                            title="Imprimir Aviso de Férias"
+                            title="Imprimir Aviso de Férias — a pessoa já vem assinar na hora, então marca assinado automaticamente"
                             aria-label={`Imprimir Aviso de Férias de ${p.nome}`}
                             className="inline-flex size-7 items-center justify-center rounded-sm border border-border-hi bg-secondary text-secondary-foreground hover:opacity-85"
+                            onClick={() => {
+                              if (!p.avisoAssinadoEm) {
+                                registrarAvisoAssinado(p.id).then((r) => {
+                                  if (!r.error) {
+                                    atualizarPeriodo({
+                                      ...p,
+                                      avisoAssinadoEm: r.avisoAssinadoEm ?? null,
+                                      avisoAssinadoPor: r.avisoAssinadoPor ?? null,
+                                    });
+                                  }
+                                });
+                              }
+                            }}
                           >
                             <Printer className="size-3.5" />
                           </a>
                         )}
+                        {p.gozoInicio && <AssinaturaButton periodo={p} onSaved={atualizarPeriodo} />}
                       </div>
                     </TableCell>
                   </TableRow>

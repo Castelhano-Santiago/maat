@@ -51,6 +51,7 @@ type Terceiro = {
   recebeCestaComoVR: boolean;
   recebeValeGas: boolean | null;
   valeGasPecunia: boolean;
+  cidade: string | null;
   empresa: { nome: string };
 };
 
@@ -82,6 +83,7 @@ const terceiroFormSchema = z.object({
   recebeCestaComoVR: z.enum(BOOL),
   recebeValeGas: z.enum(HERANCA),
   valeGasPecunia: z.enum(BOOL),
+  cidade: z.string(),
 });
 
 type TerceiroFormValues = z.infer<typeof terceiroFormSchema>;
@@ -135,6 +137,7 @@ export function TerceirosTable({ terceiros, empresas }: { terceiros: Terceiro[];
       recebeCestaComoVR: "false",
       recebeValeGas: "herda",
       valeGasPecunia: "false",
+      cidade: "",
     });
     setDialogOpen(true);
   }
@@ -152,6 +155,7 @@ export function TerceirosTable({ terceiros, empresas }: { terceiros: Terceiro[];
       recebeCestaComoVR: terceiro.recebeCestaComoVR ? "true" : "false",
       recebeValeGas: heredaToForm(terceiro.recebeValeGas),
       valeGasPecunia: terceiro.valeGasPecunia ? "true" : "false",
+      cidade: terceiro.cidade ?? "",
     });
     setDialogOpen(true);
   }
@@ -167,6 +171,7 @@ export function TerceirosTable({ terceiros, empresas }: { terceiros: Terceiro[];
       valorValeRefeicao: values.valorValeRefeicao ? paraNumero(values.valorValeRefeicao) : null,
       recebeCestaComoVR: values.recebeCestaComoVR === "true",
       recebeValeGas: formToHeranca(values.recebeValeGas),
+      cidade: values.cidade || null,
       valeGasPecunia: values.valeGasPecunia === "true",
     };
     startTransition(async () => {
@@ -363,6 +368,15 @@ export function TerceirosTable({ terceiros, empresas }: { terceiros: Terceiro[];
                     </SelectContent>
                   </Select>
                 </div>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="cidade">Cidade (opcional)</Label>
+                <Input
+                  id="cidade"
+                  placeholder="só pra empresas com vale gás por cidade — deve bater com o nome cadastrado na empresa"
+                  {...register("cidade")}
+                />
               </div>
 
               <DialogFooter>

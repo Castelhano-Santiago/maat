@@ -71,9 +71,29 @@ const FERIADOS_DO_ANO: Record<number, [number, number][]> = {
   ],
 };
 
+// Dias do mês que são feriado (nacional, municipal de Cuiabá ou do ano), mesmo os que caem no domingo.
+export function feriadosDoMes(competencia: string): number[] {
+  const [mes, ano] = competencia.split("/").map(Number);
+  const feriados = feriadosDoAno(ano);
+  const dias = new Date(Date.UTC(ano, mes, 0)).getUTCDate();
+  const lista: number[] = [];
+  for (let dia = 1; dia <= dias; dia++) if (feriados.has(Date.UTC(ano, mes - 1, dia))) lista.push(dia);
+  return lista;
+}
+
 export function calendarioCompetencia(competencia: string): CalendarioCompetencia {
   const [mes, ano] = competencia.split("/").map(Number);
   const dias = new Date(Date.UTC(ano, mes, 0)).getUTCDate();
+  const feriados = feriadosDoAno(ano);
+  let diasDsr = 0;
+  for (let dia = 1; dia <= dias; dia++) {
+    const data = new Date(Date.UTC(ano, mes - 1, dia));
+    if (data.getUTCDay() === 0 || feriados.has(data.getTime())) diasDsr++;
+  }
+  return { dias, diasUteis: dias - diasDsr, diasDsr };
+}
+
+function feriadosDoAno(ano: number): Set<number> {
   // Carnaval é ponto facultativo, não feriado: o ERP não o conta como dia de descanso no DSR
   // (fev/2026 fechou em 4 domingos ÷ 24 dias úteis). Corpus Christi o ERP conta (jun/2026: 5 ÷ 25).
   const carnaval = feriadosNacionais(ano)[1].getTime();
@@ -85,12 +105,7 @@ export function calendarioCompetencia(competencia: string): CalendarioCompetenci
   feriados.add(Date.UTC(ano, 11, 8));
   // Feriados de um ano só (eleições — pagas como feriado pelo Código Eleitoral), informados pelo DP.
   for (const [m, d] of FERIADOS_DO_ANO[ano] ?? []) feriados.add(Date.UTC(ano, m - 1, d));
-  let diasDsr = 0;
-  for (let dia = 1; dia <= dias; dia++) {
-    const data = new Date(Date.UTC(ano, mes - 1, dia));
-    if (data.getUTCDay() === 0 || feriados.has(data.getTime())) diasDsr++;
-  }
-  return { dias, diasUteis: dias - diasDsr, diasDsr };
+  return feriados;
 }
 
 export function calcularInss(base: number, p: ParametrosFolha): number {

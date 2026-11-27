@@ -194,7 +194,38 @@ export async function carregarContexto13(empresaId: string, competencia: string,
   }
   const outraEmpresa = tipo === "13_2" ? await carregarTransferidos(empresaId, ano) : null;
   const pensoes = tipo === "13_2" ? await carregarPensoes(empresaId) : undefined;
-  return { historico, mesesImportados: new Set(mensais.map((f) => Number(f.competencia.slice(0, 2)))), primeiraParcela, dezembroAnterior, outraEmpresa, pensoes };
+  const afastamentos = await carregarAfastamentos13(empresaId, mensais.flatMap((f) => f.itens.map((i) => i.situacao)));
+  return { historico, mesesImportados: new Set(mensais.map((f) => Number(f.competencia.slice(0, 2)))), primeiraParcela, dezembroAnterior, outraEmpresa, pensoes, afastamentos };
+}
+
+// Afastamentos do cadastro (histórico + afastamento atual) para os avos do 13º nos meses sem folha.
+// O fim gravado é o dia do retorno. Ficam de fora os de licença-maternidade (reconhecidos pela
+// situação "Afastado em dd/mm/aaaa ... MATERNIDADE" das folhas ou pelo motivo atual do cadastro).
+async function carregarAfastamentos13(empresaId: string, situacoes: string[]): Promise<Map<string, { inicio: number; fim: number | null }[]>> {
+  const funcionarios = await prisma.funcionario.findMany({
+    where: { empresaId },
+    select: { matricula: true, status: true, dataAfastamento: true, dataRetorno: true, motivoAfastamento: true, afastamentos: { select: { dataInicio: true, dataFim: true } } },
+  });
+  const inicioMaternidade = new Set<number>();
+  for (const s of situacoes) {
+    const m = /^Afastado em (\d{2})\/(\d{2})\/(\d{4}).*MATERNIDADE/i.exec(s);
+    if (m) inicioMaternidade.add(Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1])));
+  }
+  const dia = (d: Date) => Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+  const mapa = new Map<string, { inicio: number; fim: number | null }[]>();
+  for (const f of funcionarios) {
+    const periodos: { inicio: number; fim: number | null }[] = [];
+    for (const a of f.afastamentos) {
+      if (!inicioMaternidade.has(dia(a.dataInicio))) periodos.push({ inicio: dia(a.dataInicio), fim: a.dataFim ? dia(a.dataFim) : null });
+    }
+    if (f.dataAfastamento && !/MATERNIDADE/i.test(f.motivoAfastamento ?? "") && !inicioMaternidade.has(dia(f.dataAfastamento))) {
+      const inicio = dia(f.dataAfastamento);
+      const fim = f.dataRetorno && f.dataRetorno > f.dataAfastamento ? dia(f.dataRetorno) : f.status === "afastado" ? null : undefined;
+      if (fim !== undefined && !periodos.some((p) => p.inicio <= inicio && (p.fim === null || p.fim > inicio))) periodos.push({ inicio, fim });
+    }
+    if (periodos.length) mapa.set(f.matricula.padStart(6, "0"), periodos);
+  }
+  return mapa;
 }
 
 // Transferidos entre empresas do grupo (ex.: Pantanal → Rápido): o ERP soma na média do 13º as

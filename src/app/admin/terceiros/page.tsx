@@ -22,6 +22,7 @@ export default async function TerceirosPage() {
     recebeCestaComoVR: t.recebeCestaComoVR,
     recebeValeGas: t.recebeValeGas,
     valeGasPecunia: t.valeGasPecunia,
+    cidade: t.cidade,
     empresa: { nome: t.empresa.nome },
   }));
 

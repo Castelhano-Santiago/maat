@@ -29,6 +29,10 @@ export type Contexto13 = {
   outraEmpresa?: Map<string, { empresa: string; matricula: string; meses: MesHistorico[] }> | null;
   // Cadastro de pensões da empresa (aba Pensões); undefined = não conferir a pensão.
   pensoes?: CadastroPensoes | null;
+  // Afastamentos do cadastro (INSS, licença não remunerada...), por matrícula, para os meses ainda
+  // sem folha importada. Datas em ms UTC; `fim` = dia do retorno (já trabalhado), null = sem retorno.
+  // Licença-maternidade fica de fora (conta como tempo de serviço).
+  afastamentos?: Map<string, { inicio: number; fim: number | null }[]>;
 };
 
 const TOLERANCIA = 0.02;
@@ -135,7 +139,8 @@ type CalculoAvos = { avos: number; mesesSemFolha: number[]; meses: string[] };
 // Avos do ano: mês conta quando a pessoa tem 15 dias ou mais trabalhados (salário, férias,
 // atestado e licença-maternidade contam; afastamento pelo INSS e faltas não). Meses sem folha
 // mensal importada são projetados como trabalhados — salvo afastamento/desligamento informado
-// na situação do 13º a partir daquele mês.
+// na situação do 13º a partir daquele mês e os períodos de afastamento do cadastro (ex.: VPar 010255,
+// licença não remunerada até o retorno em 23/11 → novembro com 8 dias, não conta).
 export function calcularAvos(f: FuncionarioFolha, ano: number, ctx: Contexto13): CalculoAvos {
   const adm = data(f.admissao);
   // Licença-maternidade conta como tempo de serviço: não interrompe os avos.
@@ -171,7 +176,15 @@ export function calcularAvos(f: FuncionarioFolha, ano: number, ctx: Contexto13):
         if (saida.mes < mes) fim = 0;
         else if (saida.mes === mes) fim = saida.dia - 1;
       }
-      conta = fim - inicio + 1 >= 15;
+      let dias = Math.max(0, fim - inicio + 1);
+      // Dias do mês dentro de um afastamento do cadastro (do início até a véspera do retorno).
+      for (const a of ctx.afastamentos?.get(f.matricula) ?? []) {
+        for (let dia = inicio; dia <= fim; dia++) {
+          const t = Date.UTC(ano, mes - 1, dia);
+          if (t >= a.inicio && (a.fim === null || t < a.fim)) dias--;
+        }
+      }
+      conta = dias >= 15;
     }
     if (conta) {
       avos++;

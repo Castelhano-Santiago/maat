@@ -554,6 +554,9 @@ model Terceiro {
   recebeValeGas  Boolean?
   // Opção manual: recebe o valor da entrega em dinheiro (pecúnia) em vez da quantidade de vale.
   valeGasPecunia Boolean  @default(false)
+  // Empresas com valor de vale gás por cidade (ex.: LOGTRANS): terceiro não vem da folha, então a
+  // cidade é preenchida manualmente aqui (deve bater com o nome cadastrado em Empresa.cidades).
+  cidade         String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

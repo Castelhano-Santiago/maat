@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { usePodeOperar } from "@/components/permissoes-provider";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import {
   desfazerAvisoAssinado,
@@ -115,6 +116,9 @@ export function AvisosWhatsapp({
   periodos: FeriasLinha[];
   onAtualizado: (p: FeriasLinha) => void;
 }) {
+  // Quem só tem "consultar" em Férias pode ver a lista, imprimir e marcar assinatura — mas não
+  // enviar/desfazer aviso de WhatsApp (isso exige "operar").
+  const podeOperar = usePodeOperar("ferias");
   const hoje = hojeUTC();
   // Rotina de segunda-feira: quem começa as férias entre 30 e 36 dias depois — assim ninguém
   // recebe o aviso com menos de 30 dias e ninguém fica de fora de uma semana pra outra.
@@ -405,6 +409,20 @@ export function AvisosWhatsapp({
           <input type="checkbox" checked={ocultarEnviados} onChange={(e) => setOcultarEnviados(e.target.checked)} />
           ocultar já enviados
         </label>
+        <a
+          href={`/admin/ferias/pendentes-assinatura-pdf?${new URLSearchParams({
+            ...(de && { de }),
+            ...(ate && { ate }),
+            ...(empresa && { empresa }),
+          }).toString()}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Relatório de quem ainda não assinou o aviso, no período filtrado acima"
+          className="ml-auto inline-flex items-center gap-[7px] rounded-sm border border-border-hi bg-secondary px-3 py-1.5 font-mono text-[11px] font-bold tracking-[.06em] text-secondary-foreground uppercase hover:opacity-85"
+        >
+          <FileSignature className="size-3.5" />
+          Relatório de quem faltou assinar
+        </a>
       </div>
 
       <div className="flex flex-wrap items-end gap-3">
@@ -451,10 +469,12 @@ export function AvisosWhatsapp({
               Imprimir avisos ({selecionadosTodos.length})
             </a>
           )}
-          <Button disabled={!!fila || marcados.length === 0} onClick={iniciarSequencia}>
-            <ListChecks />
-            Enviar para os selecionados ({marcados.length})
-          </Button>
+          {podeOperar && (
+            <Button disabled={!!fila || marcados.length === 0} onClick={iniciarSequencia}>
+              <ListChecks />
+              Enviar para os selecionados ({marcados.length})
+            </Button>
+          )}
         </div>
       </div>
 
@@ -628,34 +648,35 @@ export function AvisosWhatsapp({
                       >
                         <Printer className="size-3.5" />
                       </a>
-                      {p.avisoWhatsappEm ? (
-                        <Button size="xs" variant="ghost" disabled={isPending} onClick={() => desfazer(p)}>
-                          <Undo2 />
-                          Desfazer
-                        </Button>
-                      ) : esperando ? (
-                        <>
-                          <Button size="xs" disabled={isPending} onClick={() => confirmarEnvio(p)}>
-                            <Check />
-                            Já enviei
+                      {podeOperar &&
+                        (p.avisoWhatsappEm ? (
+                          <Button size="xs" variant="ghost" disabled={isPending} onClick={() => desfazer(p)}>
+                            <Undo2 />
+                            Desfazer
                           </Button>
-                          <Button size="xs" variant="secondary" onClick={() => tirarDeAguardando(p.id)}>
-                            <X />
-                            Não enviei
-                          </Button>
-                        </>
-                      ) : (
-                        <>
-                          <Button size="xs" variant="secondary" onClick={() => testar(p)}>
-                            <FlaskConical />
-                            Teste
-                          </Button>
-                          <Button size="xs" disabled={!cel} onClick={() => enviar(p)}>
-                            <Send />
-                            Enviar aviso
-                          </Button>
-                        </>
-                      )}
+                        ) : esperando ? (
+                          <>
+                            <Button size="xs" disabled={isPending} onClick={() => confirmarEnvio(p)}>
+                              <Check />
+                              Já enviei
+                            </Button>
+                            <Button size="xs" variant="secondary" onClick={() => tirarDeAguardando(p.id)}>
+                              <X />
+                              Não enviei
+                            </Button>
+                          </>
+                        ) : (
+                          <>
+                            <Button size="xs" variant="secondary" onClick={() => testar(p)}>
+                              <FlaskConical />
+                              Teste
+                            </Button>
+                            <Button size="xs" disabled={!cel} onClick={() => enviar(p)}>
+                              <Send />
+                              Enviar aviso
+                            </Button>
+                          </>
+                        ))}
                     </div>
                   </TableCell>
                 </TableRow>
